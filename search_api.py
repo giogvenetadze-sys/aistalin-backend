@@ -324,7 +324,7 @@ async def chat(req: ChatRequest):
             model_name=CHAT_MODEL,
             system_instruction=SYSTEM_INSTRUCTION,
             generation_config=genai.types.GenerationConfig(
-                max_output_tokens=1000,
+                max_output_tokens=2000,
                 temperature=0.2,
             )
         )
