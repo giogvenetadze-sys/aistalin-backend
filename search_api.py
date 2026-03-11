@@ -346,6 +346,43 @@ async def chat(req: ChatRequest):
 
     return ChatResponse(query=req.query, answer=answer, sources=sources)
 
+
+# ── Volume Endpoint ──────────────────────────────────────────────────────
+@app.get("/volume/{volume_num}")
+async def get_volume_content(volume_num: int, language: str = "ka"):
+    """
+    Returns full content of a volume: all chunks grouped by article title.
+    language: "ka" (default) | "en" | "ru"
+    Used by the frontend reader modal.
+    """
+    if language not in ["en", "ka", "ru"]:
+        raise HTTPException(400, "language must be 'en', 'ka', or 'ru'")
+
+    sql = """
+        SELECT
+            CASE
+                WHEN $2 = 'ka' THEN w.title_ka
+                WHEN $2 = 'ru' THEN w.title_ru
+                ELSE                w.title_en
+            END          AS title,
+            c.chunk_text,
+            c.id         AS chunk_id
+        FROM aistalin_chunks c
+        JOIN aistalin_works  w ON w.id = c.work_id
+        WHERE w.volume_num = $1
+          AND c.language   = $2
+        ORDER BY c.id ASC
+    """
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, volume_num, language)
+
+    if not rows:
+        return {"volume": volume_num, "chapters": [], "error": "Volume not found or not yet loaded"}
+
+    chapters = [{"title": r["title"], "chunk_text": r["chunk_text"]} for r in rows]
+    return {"volume": volume_num, "language": language, "chapters": chapters}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("search_api:app", host="0.0.0.0", port=8000, reload=True)
