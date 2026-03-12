@@ -48,6 +48,18 @@ async def startup():
     )
     print("✅ DB Pool ready")
 
+    # ✅ feedback ცხრილი — პირველ გაშვებაზე ავტომატურად შეიქმნება
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id         SERIAL PRIMARY KEY,
+                name       TEXT         NOT NULL DEFAULT 'ანონიმი',
+                message    TEXT         NOT NULL,
+                created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+            );
+        """)
+    print("✅ feedback table ready")
+
 @app.on_event("shutdown")
 async def shutdown():
     await db_pool.close()
@@ -347,6 +359,43 @@ async def chat(req: ChatRequest):
     return ChatResponse(query=req.query, answer=answer, sources=sources)
 
 
+# ── Volume Endpoint ──────────────────────────────────────────────────────
+@app.get("/volume/{volume_num}")
+async def get_volume_content(volume_num: int, language: str = "ka"):
+    """
+    Returns full content of a volume: all chunks grouped by article title.
+    language: "ka" (default) | "en" | "ru"
+    Used by the frontend reader modal.
+    """
+    if language not in ["en", "ka", "ru"]:
+        raise HTTPException(400, "language must be 'en', 'ka', or 'ru'")
+
+    sql = """
+        SELECT
+            CASE
+                WHEN $2 = 'ka' THEN w.title_ka
+                WHEN $2 = 'ru' THEN w.title_ru
+                ELSE                w.title_en
+            END          AS title,
+            c.chunk_text,
+            c.id         AS chunk_id
+        FROM aistalin_chunks c
+        JOIN aistalin_works  w ON w.id = c.work_id
+        WHERE w.volume_num = $1
+          AND c.language   = $2
+        ORDER BY c.id ASC
+    """
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(sql, volume_num, language)
+
+    if not rows:
+        return {"volume": volume_num, "chapters": [], "error": "Volume not found or not yet loaded"}
+
+    chapters = [{"title": r["title"], "chunk_text": r["chunk_text"]} for r in rows]
+    return {"volume": volume_num, "language": language, "chapters": chapters}
+
+
 # ══════════════════════════════════════════════════════════════
 #  FEEDBACK ENDPOINT
 #  POST /feedback  — saves user message to feedback table
@@ -356,30 +405,13 @@ class FeedbackRequest(BaseModel):
     name: str = "ანონიმი"
     message: str
 
-@app.on_event("startup")
-async def create_feedback_table():
-    """Creates the feedback table if it does not exist yet.
-    Safe to run on every startup — uses CREATE TABLE IF NOT EXISTS."""
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS feedback (
-                id         SERIAL PRIMARY KEY,
-                name       TEXT    NOT NULL DEFAULT 'ანონიმი',
-                message    TEXT    NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-        """)
-    print("✅ feedback table ready")
-
 @app.post("/feedback", status_code=201)
 async def submit_feedback(req: FeedbackRequest):
-    """Accepts user feedback and stores it in the feedback table."""
     msg = req.message.strip()
     if not msg:
         raise HTTPException(400, "message cannot be empty")
     if len(msg) > 4000:
         raise HTTPException(400, "message too long (max 4000 chars)")
-
     async with db_pool.acquire() as conn:
         await conn.execute(
             "INSERT INTO feedback (name, message) VALUES ($1, $2)",
