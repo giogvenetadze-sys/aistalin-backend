@@ -14,6 +14,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Optional
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 load_dotenv()
 
@@ -26,6 +29,12 @@ TOP_K       = 10
 RRF_K       = 60
 
 genai.configure(api_key=GEMINI_API_KEY)
+
+SMTP_HOST     = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER     = os.getenv("SMTP_USER", "")       # გამომგზავნი gmail
+SMTP_PASS     = os.getenv("SMTP_PASS", "")       # Gmail App Password
+NOTIFY_EMAIL  = os.getenv("NOTIFY_EMAIL", "contact@aistalin.io")
 
 app = FastAPI(title="AiStalin Hybrid Search API", version="1.3.0")
 app.add_middleware(
@@ -59,6 +68,24 @@ async def startup():
             );
         """)
     print("✅ feedback table ready")
+
+    # ✅ ALTER TABLE — adds new metadata columns safely (idempotent)
+    meta_cols = [
+        ("ip_address",         "TEXT    DEFAULT 'Unknown'"),
+        ("location",           "TEXT    DEFAULT 'Unknown'"),
+        ("device",             "TEXT    DEFAULT ''"),
+        ("time_spent_seconds", "INTEGER DEFAULT 0"),
+        ("is_subscribed",      "BOOLEAN DEFAULT FALSE"),
+    ]
+    async with db_pool.acquire() as conn:
+        for col, col_def in meta_cols:
+            try:
+                await conn.execute(
+                    f"ALTER TABLE feedback ADD COLUMN IF NOT EXISTS {col} {col_def};"
+                )
+            except Exception:
+                pass  # column already exists — ignore
+    print("✅ feedback columns ready")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -402,23 +429,107 @@ async def get_volume_content(volume_num: int, language: str = "ka"):
 # ══════════════════════════════════════════════════════════════
 
 class FeedbackRequest(BaseModel):
-    name: str = "ანონიმი"
-    message: str
+    name:               str  = "ანონიმი"
+    message:            str
+    ip_address:         str  = "Unknown"
+    location:           str  = "Unknown"
+    device:             str  = ""
+    time_spent_seconds: int  = 0
+    is_subscribed:      bool = False
 
 @app.post("/feedback", status_code=201)
 async def submit_feedback(req: FeedbackRequest):
+    """Saves feedback to DB and sends email notification to contact@aistalin.io"""
     msg = req.message.strip()
     if not msg:
         raise HTTPException(400, "message cannot be empty")
     if len(msg) > 4000:
         raise HTTPException(400, "message too long (max 4000 chars)")
+
+    name = req.name.strip() or "ანონიმი"
+
+    # ── Save to PostgreSQL ────────────────────────────────────────────────
     async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO feedback (name, message) VALUES ($1, $2)",
-            req.name.strip() or "ანონიმი",
-            msg
+        await conn.execute("""
+            INSERT INTO feedback
+                (name, message, ip_address, location, device, time_spent_seconds, is_subscribed)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """,
+            name,
+            msg,
+            req.ip_address,
+            req.location,
+            req.device[:500] if req.device else "",   # trim long user-agent
+            req.time_spent_seconds,
+            req.is_subscribed,
         )
+    print(f"✅ Feedback saved | {name} | {req.location}")
+
+    # ── Send email notification ───────────────────────────────────────────
+    if SMTP_USER and SMTP_PASS:
+        await asyncio.to_thread(
+            _send_feedback_email,
+            name, msg, req.ip_address, req.location,
+            req.device, req.time_spent_seconds, req.is_subscribed
+        )
+
     return {"status": "ok", "message": "feedback saved"}
+
+
+def _send_feedback_email(
+    name: str, message: str, ip: str, location: str,
+    device: str, time_spent: int, subscribed: bool
+):
+    """Blocking SMTP call — runs in asyncio.to_thread so it doesn't block the event loop."""
+    try:
+        mins, secs = divmod(time_spent, 60)
+        time_str   = f"{mins}m {secs}s"
+
+        html_body = f"""
+<html><body style="font-family:Georgia,serif;background:#1a0c04;color:#f5e6c8;padding:24px;">
+  <h2 style="color:#d4a017;border-bottom:1px solid #5c2d0f;padding-bottom:8px;">
+    📨 AiStalin.io — ახალი უკუკავშირი
+  </h2>
+  <table style="width:100%;border-collapse:collapse;margin-top:16px;">
+    <tr><td style="padding:6px 12px;color:#d4a017;width:160px;">სახელი</td>
+        <td style="padding:6px 12px;">{name}</td></tr>
+    <tr style="background:rgba(255,255,255,0.04);">
+        <td style="padding:6px 12px;color:#d4a017;">მდებარეობა</td>
+        <td style="padding:6px 12px;">{location}</td></tr>
+    <tr><td style="padding:6px 12px;color:#d4a017;">IP</td>
+        <td style="padding:6px 12px;">{ip}</td></tr>
+    <tr style="background:rgba(255,255,255,0.04);">
+        <td style="padding:6px 12px;color:#d4a017;">საიტზე გატარებული დრო</td>
+        <td style="padding:6px 12px;">{time_str}</td></tr>
+    <tr><td style="padding:6px 12px;color:#d4a017;">პრემიუმ</td>
+        <td style="padding:6px 12px;">{"✅ დიახ" if subscribed else "❌ არა"}</td></tr>
+    <tr style="background:rgba(255,255,255,0.04);">
+        <td style="padding:6px 12px;color:#d4a017;">მოწყობილობა</td>
+        <td style="padding:6px 12px;font-size:0.85em;opacity:0.7;">{device[:200]}</td></tr>
+  </table>
+  <div style="margin-top:20px;background:rgba(26,12,4,0.8);border:1px solid #5c2d0f;
+              border-radius:6px;padding:16px;">
+    <p style="color:#d4a017;margin:0 0 8px 0;font-weight:bold;">მესიჯი:</p>
+    <p style="margin:0;line-height:1.7;">{message}</p>
+  </div>
+</body></html>"""
+
+        mail = MIMEMultipart("alternative")
+        mail["Subject"] = f"[AiStalin] უკუკავშირი — {name}"
+        mail["From"]    = SMTP_USER
+        mail["To"]      = NOTIFY_EMAIL
+        mail.attach(MIMEText(html_body, "html", "utf-8"))
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, NOTIFY_EMAIL, mail.as_string())
+        print(f"✅ Email sent to {NOTIFY_EMAIL}")
+
+    except Exception as e:
+        # Email failure should never break the API response
+        print(f"⚠ Email send failed: {e}")
 
 
 if __name__ == "__main__":
