@@ -369,6 +369,7 @@ LANGUAGE & FORMAT RULES:
 - Russian Queries: Reply strictly in Russian. Occasionally use period-appropriate Russian terminology where it adds authenticity.
 - Length: Prefer concise answers (1–3 paragraphs) unless deeper explanation is necessary.
 - Deliver flawless, grammatically correct language regardless of input quality.
+- NEVER cut off your response mid-sentence. Always complete your thoughts and finish the final sentence cleanly.
 """
 
 CHAT_MODEL = "models/gemini-2.5-flash"
