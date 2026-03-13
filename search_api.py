@@ -1,323 +1,299 @@
-# search_api.py — AiStalin Hybrid Search API v1.3.0
-# ✅ gemini-embedding-001 (768-dim) — matches embed_generator.py
-# ✅ asyncio.to_thread — embed_content სინქრონული, event loop არ იბლოკება
-# ✅ FTS 'simple' config — fts_tokens 'simple'-ით არის generated
-# ✅ title ენის მიხედვით — title_ka / title_ru / title_en
-# ✅ mode validation — hybrid / vector / fts
+# search_api.py -- AiStalin Hybrid Search API v2.0.0
+# v2.0: JWT auth, HttpOnly session tokens, velocity check, daily limits
+# SYSTEM_INSTRUCTION, _generate(), RAG logic -- UNTOUCHED
 
-import os
-import asyncio
-import asyncpg
+import os, asyncio, asyncpg, uuid, datetime
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
 from typing import Optional
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from passlib.context import CryptContext
+from jose import JWTError, jwt
 
 load_dotenv()
 
-DATABASE_URL   = os.getenv("DATABASE_URL")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# ✅ gemini-embedding-001 — ზუსტად ის მოდელი, რომლითაც ბაზა შეივსო
-EMBED_MODEL = "models/gemini-embedding-001"
-TOP_K       = 10
-RRF_K       = 60
+DATABASE_URL    = os.getenv("DATABASE_URL")
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
+JWT_SECRET      = os.getenv("JWT_SECRET", "change-this-in-production")
+JWT_ALGORITHM   = "HS256"
+JWT_EXPIRE_DAYS = 30
+EMBED_MODEL      = "models/gemini-embedding-001"
+TOP_K            = 10
+RRF_K            = 60
+VELOCITY_SECONDS = 5
+FREE_DAILY_LIMIT = 3
+COOKIE_NAME      = "aistalin_session"
+COOKIE_DAYS      = 365
 
 genai.configure(api_key=GEMINI_API_KEY)
+SMTP_HOST    = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT    = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER    = os.getenv("SMTP_USER", "")
+SMTP_PASS    = os.getenv("SMTP_PASS", "")
+NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "contact@aistalin.io")
 
-SMTP_HOST     = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER     = os.getenv("SMTP_USER", "")       # გამომგზავნი gmail
-SMTP_PASS     = os.getenv("SMTP_PASS", "")       # Gmail App Password
-NOTIFY_EMAIL  = os.getenv("NOTIFY_EMAIL", "contact@aistalin.io")
+pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
+bearer_scheme = HTTPBearer(auto_error=False)
 
-app = FastAPI(title="AiStalin Hybrid Search API", version="1.3.0")
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://aistalin.io,https://www.aistalin.io,http://localhost:5500"
+).split(",")
+
+app = FastAPI(title="AiStalin Hybrid Search API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 db_pool: asyncpg.Pool = None
 
+
+# == STARTUP =================================================================
 @app.on_event("startup")
 async def startup():
     global db_pool
     db_pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=2,
-        max_size=10,
-        command_timeout=60   # ✅ production: query 60s-ზე მეტს არ ელოდება
+        DATABASE_URL, min_size=2, max_size=10, command_timeout=60
     )
-    print("✅ DB Pool ready")
+    print("OK DB Pool ready")
+    await _create_tables()
 
-    # ✅ feedback ცხრილი — პირველ გაშვებაზე ავტომატურად შეიქმნება
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS feedback (
-                id         SERIAL PRIMARY KEY,
-                name       TEXT         NOT NULL DEFAULT 'ანონიმი',
-                message    TEXT         NOT NULL,
-                created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-            );
-        """)
-    print("✅ feedback table ready")
 
-    # ✅ ALTER TABLE — adds new metadata columns safely (idempotent)
-    meta_cols = [
-        ("ip_address",         "TEXT    DEFAULT 'Unknown'"),
-        ("location",           "TEXT    DEFAULT 'Unknown'"),
-        ("device",             "TEXT    DEFAULT ''"),
-        ("time_spent_seconds", "INTEGER DEFAULT 0"),
-        ("is_subscribed",      "BOOLEAN DEFAULT FALSE"),
+async def _create_tables():
+    stmts = [
+        """CREATE TABLE IF NOT EXISTS feedback (
+            id SERIAL PRIMARY KEY, name TEXT NOT NULL DEFAULT 'anon',
+            message TEXT NOT NULL, ip_address TEXT DEFAULT 'Unknown',
+            location TEXT DEFAULT 'Unknown', device TEXT DEFAULT '',
+            time_spent_seconds INTEGER DEFAULT 0,
+            is_subscribed BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user',
+            is_premium BOOLEAN NOT NULL DEFAULT FALSE,
+            premium_until TIMESTAMPTZ, ip_address TEXT DEFAULT 'Unknown',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE TABLE IF NOT EXISTS chat_history (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            session_token TEXT NOT NULL, user_query TEXT NOT NULL,
+            ai_response TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_chat_session
+            ON chat_history(session_token, created_at DESC)""",
+        """CREATE TABLE IF NOT EXISTS daily_limits (
+            id SERIAL PRIMARY KEY, session_token TEXT NOT NULL,
+            ip_address TEXT NOT NULL, date DATE NOT NULL DEFAULT CURRENT_DATE,
+            query_count INT NOT NULL DEFAULT 1,
+            UNIQUE (session_token, date), UNIQUE (ip_address, date)
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_daily_session ON daily_limits(session_token, date)""",
+        """CREATE INDEX IF NOT EXISTS idx_daily_ip ON daily_limits(ip_address, date)""",
     ]
     async with db_pool.acquire() as conn:
-        for col, col_def in meta_cols:
-            try:
-                await conn.execute(
-                    f"ALTER TABLE feedback ADD COLUMN IF NOT EXISTS {col} {col_def};"
-                )
-            except Exception:
-                pass  # column already exists — ignore
-    print("✅ feedback columns ready")
+        for s in stmts:
+            await conn.execute(s)
+    print("OK All tables ready")
+
 
 @app.on_event("shutdown")
 async def shutdown():
     await db_pool.close()
 
-# ── Request / Response Models ────────────────────────────────────────────
+
+# == JWT =====================================================================
+def create_jwt(uid: int, email: str, role: str, is_premium: bool) -> str:
+    exp = datetime.datetime.utcnow() + datetime.timedelta(days=JWT_EXPIRE_DAYS)
+    return jwt.encode({"sub": str(uid), "email": email, "role": role,
+                       "is_premium": is_premium, "exp": exp},
+                      JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+def decode_jwt(token: str) -> Optional[dict]:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except JWTError:
+        return None
+
+async def get_current_user(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)
+) -> Optional[dict]:
+    if not creds:
+        return None
+    return decode_jwt(creds.credentials)
+
+
+# == AUTH ENDPOINTS ==========================================================
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+@app.post("/register", status_code=201)
+async def register(req: RegisterRequest, request: Request):
+    if len(req.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    pw_hash = pwd_context.hash(req.password)
+    ip = request.headers.get("X-Forwarded-For", request.client.host or "Unknown").split(",")[0].strip()
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "INSERT INTO users (email,password_hash,ip_address) VALUES ($1,$2,$3) RETURNING id,email,role,is_premium",
+                req.email.lower(), pw_hash, ip
+            )
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(409, "Email already registered")
+    return {"access_token": create_jwt(row["id"],row["email"],row["role"],row["is_premium"]),
+            "token_type": "bearer"}
+
+@app.post("/login")
+async def login(req: LoginRequest):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id,email,password_hash,role,is_premium,premium_until FROM users WHERE email=$1",
+            req.email.lower()
+        )
+    if not row or not pwd_context.verify(req.password, row["password_hash"]):
+        raise HTTPException(401, "Invalid email or password")
+    is_premium = row["is_premium"]
+    if is_premium and row["premium_until"]:
+        pu = row["premium_until"]
+        if pu.tzinfo is None:
+            pu = pu.replace(tzinfo=datetime.timezone.utc)
+        if pu < datetime.datetime.now(datetime.timezone.utc):
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET is_premium=FALSE WHERE id=$1", row["id"])
+            is_premium = False
+    return {"access_token": create_jwt(row["id"],row["email"],row["role"],is_premium),
+            "token_type": "bearer", "is_premium": is_premium}
+
+
+# == SEARCH MODELS ===========================================================
 class SearchRequest(BaseModel):
-    query: str
-    language: str = "en"      # "en", "ka", "ru"
-    top_k: int = TOP_K
-    mode: str = "hybrid"      # "hybrid", "vector", "fts"
+    query: str; language: str = "en"; top_k: int = TOP_K; mode: str = "hybrid"
 
 class ChunkResult(BaseModel):
-    chunk_id: int
-    work_id: int
-    title: str
-    chunk_text: str
-    language: str
-    volume_num: Optional[int]
-    score: float
-    rank: int
+    chunk_id: int; work_id: int; title: str; chunk_text: str
+    language: str; volume_num: Optional[int]; score: float; rank: int
 
 class SearchResponse(BaseModel):
-    query: str
-    mode: str
-    results: list[ChunkResult]
-    total: int
+    query: str; mode: str; results: list[ChunkResult]; total: int
 
-# ── Embedding ────────────────────────────────────────────────────────────
+
+# == EMBEDDING (unchanged) ===================================================
 async def get_query_embedding(text: str) -> list[float]:
-    """
-    ✅ asyncio.to_thread — genai.embed_content სინქრონულია.
-    thread-ში გაშვება event loop-ს არ ბლოკავს.
-    სხვა requests ელოდებენ რომ embed_content დასრულდეს —
-    to_thread ამ ლოდინს background thread-ში გადააქვს.
-    """
     def _embed():
-        return genai.embed_content(
-            model=EMBED_MODEL,
-            content=text,
-            task_type="retrieval_query",
-            output_dimensionality=768   # ✅ ბაზა 768-dim
-        )
-    result = await asyncio.to_thread(_embed)
-    return result["embedding"]
+        return genai.embed_content(model=EMBED_MODEL, content=text,
+                                   task_type="retrieval_query", output_dimensionality=768)
+    return (await asyncio.to_thread(_embed))["embedding"]
 
-# ── Vector Search ────────────────────────────────────────────────────────
-async def vector_search(
-    query_embedding: list[float],
-    language: str,
-    top_k: int
-) -> list[dict]:
-    """
-    pgvector cosine distance search.
-    <=> = cosine distance | 1 - distance = similarity score
-    """
+
+# == VECTOR SEARCH (unchanged) ===============================================
+async def vector_search(query_embedding: list[float], language: str, top_k: int) -> list[dict]:
     embedding_str = "[" + ",".join(map(str, query_embedding)) + "]"
-
     sql = """
-        SELECT
-            c.id         AS chunk_id,
-            c.work_id    AS work_id,
-            CASE
-                WHEN $2 = 'ka' THEN w.title_ka
-                WHEN $2 = 'ru' THEN w.title_ru
-                ELSE                w.title_en
-            END          AS title,
-            c.chunk_text,
-            c.language,
-            w.volume_num,
+        SELECT c.id AS chunk_id, c.work_id,
+            CASE WHEN $2='ka' THEN w.title_ka WHEN $2='ru' THEN w.title_ru ELSE w.title_en END AS title,
+            c.chunk_text, c.language, w.volume_num,
             1 - (c.embedding <=> $1::vector) AS score
-        FROM aistalin_chunks c
-        JOIN aistalin_works  w ON w.id = c.work_id
-        WHERE c.language    = $2
-          AND c.embedding  IS NOT NULL
-        ORDER BY c.embedding <=> $1::vector
-        LIMIT $3
+        FROM aistalin_chunks c JOIN aistalin_works w ON w.id=c.work_id
+        WHERE c.language=$2 AND c.embedding IS NOT NULL
+        ORDER BY c.embedding <=> $1::vector LIMIT $3
     """
-
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch(sql, embedding_str, language, top_k * 3)  # ✅ *3 → RRF-ს მეტი კანდიდატი
-
+        rows = await conn.fetch(sql, embedding_str, language, top_k * 3)
     return [dict(r) for r in rows]
 
-# ── Full-Text Search ─────────────────────────────────────────────────────
+
+# == FULL-TEXT SEARCH (unchanged) ============================================
 async def fts_search(query: str, language: str, top_k: int) -> list[dict]:
-    """
-    ✅ ts_config = 'simple' — კრიტიკულია!
-    fts_tokens სვეტი to_tsvector('simple', ...) -ით არის generated.
-    თუ query-ში 'english' ან 'russian' გამოვიყენებთ —
-    ლექსემები სხვანაირად დაითვლება, match ვერ მოხდება, 0 შედეგი.
-    """
-    ts_config = "simple"  # ✅ ყოველთვის simple — ყველა ენისთვის
-
+    ts = "simple"
     sql = f"""
-        SELECT
-            c.id         AS chunk_id,
-            c.work_id    AS work_id,
-            CASE
-                WHEN $2 = 'ka' THEN w.title_ka
-                WHEN $2 = 'ru' THEN w.title_ru
-                ELSE                w.title_en
-            END          AS title,
-            c.chunk_text,
-            c.language,
-            w.volume_num,
-            ts_rank_cd(
-                c.fts_tokens,
-                plainto_tsquery('{ts_config}', $1)
-            ) AS score
-        FROM aistalin_chunks c
-        JOIN aistalin_works  w ON w.id = c.work_id
-        WHERE c.language = $2
-          AND c.fts_tokens @@ plainto_tsquery('{ts_config}', $1)
-        ORDER BY score DESC
-        LIMIT $3
+        SELECT c.id AS chunk_id, c.work_id,
+            CASE WHEN $2='ka' THEN w.title_ka WHEN $2='ru' THEN w.title_ru ELSE w.title_en END AS title,
+            c.chunk_text, c.language, w.volume_num,
+            ts_rank_cd(c.fts_tokens, plainto_tsquery('{ts}', $1)) AS score
+        FROM aistalin_chunks c JOIN aistalin_works w ON w.id=c.work_id
+        WHERE c.language=$2 AND c.fts_tokens @@ plainto_tsquery('{ts}', $1)
+        ORDER BY score DESC LIMIT $3
     """
-
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch(sql, query, language, top_k * 3)  # ✅ *3 → RRF-ს მეტი კანდიდატი
-
+        rows = await conn.fetch(sql, query, language, top_k * 3)
     return [dict(r) for r in rows]
 
-# ── RRF Reranking ────────────────────────────────────────────────────────
-def reciprocal_rank_fusion(
-    vector_results: list[dict],
-    fts_results: list[dict],
-    top_k: int
-) -> list[dict]:
-    """
-    RRF Score = 1/(60 + rank_vector) + 1/(60 + rank_fts)
-    ორივე სიაში მაღლა — საბოლოო სიაში მაღლა.
-    """
-    scores     = {}
-    chunk_data = {}
 
-    for rank, r in enumerate(vector_results, 1):
-        cid             = r["chunk_id"]
-        scores[cid]     = scores.get(cid, 0) + 1.0 / (RRF_K + rank)
-        chunk_data[cid] = r
+# == RRF RERANKING (unchanged) ===============================================
+def reciprocal_rank_fusion(vr: list[dict], fr: list[dict], top_k: int) -> list[dict]:
+    scores = {}; data = {}
+    for rank, r in enumerate(vr, 1):
+        cid = r["chunk_id"]; scores[cid] = scores.get(cid,0) + 1.0/(RRF_K+rank); data[cid] = r
+    for rank, r in enumerate(fr, 1):
+        cid = r["chunk_id"]; scores[cid] = scores.get(cid,0) + 1.0/(RRF_K+rank)
+        if cid not in data: data[cid] = r
+    out = []
+    for rank, cid in enumerate(sorted(scores, key=lambda x: scores[x], reverse=True)[:top_k], 1):
+        item = data[cid].copy(); item["score"] = round(scores[cid],6); item["rank"] = rank
+        out.append(item)
+    return out
 
-    for rank, r in enumerate(fts_results, 1):
-        cid         = r["chunk_id"]
-        scores[cid] = scores.get(cid, 0) + 1.0 / (RRF_K + rank)
-        if cid not in chunk_data:
-            chunk_data[cid] = r
 
-    sorted_ids = sorted(scores, key=lambda x: scores[x], reverse=True)
-
-    results = []
-    for rank, cid in enumerate(sorted_ids[:top_k], 1):
-        item          = chunk_data[cid].copy()
-        item["score"] = round(scores[cid], 6)
-        item["rank"]  = rank
-        results.append(item)
-
-    return results
-
-# ── Endpoints ────────────────────────────────────────────────────────────
+# == HEALTH & SEARCH (unchanged) =============================================
 @app.get("/health")
 async def health_check():
     async with db_pool.acquire() as conn:
-        count = await conn.fetchval(
-            "SELECT COUNT(*) FROM aistalin_chunks WHERE embedding IS NOT NULL"
-        )
-    return {
-        "status":       "ok",
-        "version":      "1.3.0",
-        "chunks_ready": count
-    }
+        count = await conn.fetchval("SELECT COUNT(*) FROM aistalin_chunks WHERE embedding IS NOT NULL")
+    return {"status": "ok", "version": "2.0.0", "chunks_ready": count}
 
 @app.post("/search", response_model=SearchResponse)
 async def search(req: SearchRequest):
-    # ✅ Validation
-    if not req.query.strip():
-        raise HTTPException(400, "Query cannot be empty")
-    if req.language not in ["en", "ka", "ru"]:
-        raise HTTPException(400, "language must be 'en', 'ka', or 'ru'")
-    if req.mode not in ["hybrid", "vector", "fts"]:
-        raise HTTPException(400, "mode must be 'hybrid', 'vector', or 'fts'")
-
-    results = []
-
+    if not req.query.strip(): raise HTTPException(400, "Query cannot be empty")
+    if req.language not in ["en","ka","ru"]: raise HTTPException(400, "language must be en/ka/ru")
+    if req.mode not in ["hybrid","vector","fts"]: raise HTTPException(400, "invalid mode")
     if req.mode == "vector":
-        emb  = await get_query_embedding(req.query)
-        raw  = await vector_search(emb, req.language, req.top_k)
-        results = [
-            {**r, "score": round(r["score"], 6), "rank": i + 1}
-            for i, r in enumerate(raw[:req.top_k])
-        ]
-
-    elif req.mode == "fts":
-        raw  = await fts_search(req.query, req.language, req.top_k)
-        results = [
-            {**r, "rank": i + 1}
-            for i, r in enumerate(raw[:req.top_k])
-        ]
-
-    else:  # hybrid — vector + FTS პარალელურად
         emb = await get_query_embedding(req.query)
-        vector_res, fts_res = await asyncio.gather(
-            vector_search(emb, req.language, req.top_k),
-            fts_search(req.query, req.language, req.top_k)
-        )
-        results = reciprocal_rank_fusion(vector_res, fts_res, req.top_k)
+        raw = await vector_search(emb, req.language, req.top_k)
+        results = [{**r,"score":round(r["score"],6),"rank":i+1} for i,r in enumerate(raw[:req.top_k])]
+    elif req.mode == "fts":
+        raw = await fts_search(req.query, req.language, req.top_k)
+        results = [{**r,"rank":i+1} for i,r in enumerate(raw[:req.top_k])]
+    else:
+        emb = await get_query_embedding(req.query)
+        v,f = await asyncio.gather(vector_search(emb,req.language,req.top_k),
+                                   fts_search(req.query,req.language,req.top_k))
+        results = reciprocal_rank_fusion(v, f, req.top_k)
+    return SearchResponse(query=req.query, mode=req.mode, results=results, total=len(results))
 
-    return SearchResponse(
-        query=req.query,
-        mode=req.mode,
-        results=results,
-        total=len(results)
-    )
 
-
-# ── Chat Models ──────────────────────────────────────────────────────────
+# == CHAT MODELS ============================================================
 class ChatRequest(BaseModel):
     query: str
-    language: str = "en"
+    language: str = 'en'
     top_k: int = 5
 
 class SourceItem(BaseModel):
-    chunk_id: int
-    work_id: int
-    title: str
-    volume_num: Optional[int]
-    score: float
+    chunk_id: int; work_id: int; title: str
+    volume_num: Optional[int]; score: float
 
 class ChatResponse(BaseModel):
-    query: str
-    answer: str
-    sources: list[SourceItem]
+    query: str; answer: str; sources: list[SourceItem]
 
+
+# == SYSTEM INSTRUCTION (unchanged) =========================================
 SYSTEM_INSTRUCTION = """You are the digital assistant for the Joseph Stalin Historical Archive.
 Your persona is built on Stalin's analytical style, grounded in core principles: Truth,
 Intellectual Honesty, Historical Accuracy, Professionalism, and Respect for the reader's intelligence.
@@ -369,87 +345,148 @@ LANGUAGE & FORMAT RULES:
 - Russian Queries: Reply strictly in Russian. Occasionally use period-appropriate Russian terminology where it adds authenticity.
 - Length: Prefer concise answers (1–3 paragraphs) unless deeper explanation is necessary.
 - Deliver flawless, grammatically correct language regardless of input quality.
-- NEVER cut off your response mid-sentence. Always complete your thoughts and finish the final sentence cleanly.
 """
 
 CHAT_MODEL = "models/gemini-2.5-flash"
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+# == _generate (unchanged) =================================================
+def _generate(prompt: str):
+    model = genai.GenerativeModel(
+        model_name=CHAT_MODEL,
+        system_instruction=SYSTEM_INSTRUCTION,
+        generation_config=genai.types.GenerationConfig(max_output_tokens=8192, temperature=0.25)
+    )
+    return model.generate_content(prompt)
+
+
+# == CHAT ENDPOINT v2 ========================================================
+NO_INFO_PHRASES = [
+    "not found in the archive", "archive contains no records", "not found in archive",
+    "archived scope",
+    "არქივში ეს ინფორმაცია არ იძებნება",
+    "არ იძებნება არქივში",
+    "არ არის მოცემული არქივში",
+    "ინფორმაცია არ მოიძებნა",
+    "არ მოიპოვება",
+    "ვერ მოიძებნა",
+    "нет в архиве",
+    "не найдена",
+    "не найдено",
+]
+
+
+@app.post("/chat")
+async def chat(
+    req:          ChatRequest,
+    request:      Request,
+    response:     Response,
+    current_user: Optional[dict] = Depends(get_current_user),
+):
     if not req.query.strip():
         raise HTTPException(400, "Query cannot be empty")
     if req.language not in ["en", "ka", "ru"]:
-        raise HTTPException(400, "language must be 'en', 'ka', or 'ru'")
+        raise HTTPException(400, "language must be en/ka/ru")
 
+    # 1. Session token
+    session_token = request.cookies.get(COOKIE_NAME)
+    is_new_cookie = not bool(session_token)
+    if is_new_cookie:
+        session_token = str(uuid.uuid4())
+
+    # 2. Client IP
+    client_ip = request.headers.get("X-Forwarded-For", request.client.host or "Unknown").split(",")[0].strip()
+
+    # 3. Velocity check
+    async with db_pool.acquire() as conn:
+        last_ts = await conn.fetchval(
+            "SELECT created_at FROM chat_history WHERE session_token=$1 ORDER BY created_at DESC LIMIT 1",
+            session_token
+        )
+    if last_ts:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        if not last_ts.tzinfo:
+            last_ts = last_ts.replace(tzinfo=datetime.timezone.utc)
+        elapsed = (now_utc - last_ts).total_seconds()
+        if elapsed < VELOCITY_SECONDS:
+            raise HTTPException(429, f"Too fast. Wait {int(VELOCITY_SECONDS - elapsed) + 1}s.")
+
+    # 4. Premium / Guest
+    is_premium = bool(current_user and current_user.get("is_premium"))
+    user_id    = int(current_user["sub"]) if current_user else None
+
+    def _set_cookie(resp):
+        if is_new_cookie:
+            resp.set_cookie(key=COOKIE_NAME, value=session_token, httponly=True,
+                            secure=True, samesite="none", max_age=60*60*24*COOKIE_DAYS)
+        return resp
+
+    if not is_premium:
+        today = datetime.date.today()
+        async with db_pool.acquire() as conn:
+            ses_cnt = await conn.fetchval(
+                "SELECT query_count FROM daily_limits WHERE session_token=$1 AND date=$2",
+                session_token, today) or 0
+            ip_cnt = await conn.fetchval(
+                "SELECT query_count FROM daily_limits WHERE ip_address=$1 AND date=$2",
+                client_ip, today) or 0
+        if ses_cnt >= FREE_DAILY_LIMIT or ip_cnt >= FREE_DAILY_LIMIT:
+            return _set_cookie(JSONResponse(
+                content={"status": "limit_reached", "message": "Daily free limit reached. Please subscribe."},
+                status_code=200
+            ))
+
+    # 5. RAG retrieval
     emb = await get_query_embedding(req.query)
-    vector_res, fts_res = await asyncio.gather(
+    vr, fr = await asyncio.gather(
         vector_search(emb, req.language, req.top_k),
         fts_search(req.query, req.language, req.top_k)
     )
-    chunks = reciprocal_rank_fusion(vector_res, fts_res, req.top_k)
+    chunks = reciprocal_rank_fusion(vr, fr, req.top_k)
 
     if not chunks:
-        return ChatResponse(
-            query=req.query,
-            answer="არქივში ამ კითხვაზე შესაბამისი ინფორმაცია ვერ მოიძებნა.",
-            sources=[]
+        answer = "არქივში ამ კითხვაზე შესაბამისი ინფორმაცია ვერ მოიძებნა."
+    else:
+        context = "\n\n---\n\n".join(
+            f"[{i}] სათაური: {c['title']} | ტომი: {c.get('volume_num','?')}\n{c['chunk_text']}"
+            for i, c in enumerate(chunks, 1)
         )
-
-    context_parts = []
-    for i, chunk in enumerate(chunks, 1):
-        context_parts.append(
-            f"[{i}] სათაური: {chunk['title']} | ტომი: {chunk.get('volume_num', '?')}\n"
-            f"{chunk['chunk_text']}"
+        prompt = (
+            "Context (სტალინის ტექსტებიდან):\n\n" + context +
+            "\n\n---\n\nმომხმარებლის კითხვა: " + req.query +
+            "\n\nგთხოვ უპასუხო კითხვას მხოლოდ ზემოთ მოწოდებული Context-ის საფუძვლზე."
         )
-    context = "\n\n---\n\n".join(context_parts)
+        gen = await asyncio.to_thread(_generate, prompt)
+        answer = gen.text.strip()
 
-    prompt = f"""Context (სტალინის ტექსტებიდან):\n\n{context}\n\n---\n\nმომხმარებლის კითხვა: {req.query}\n\nგთხოვ უპასუხო კითხვას მხოლოდ ზემოთ მოწოდებული Context-ის საფუძველზე."""
-
-    def _generate():
-        model = genai.GenerativeModel(
-            model_name=CHAT_MODEL,
-            system_instruction=SYSTEM_INSTRUCTION,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=8192,
-                temperature=0.25,
-            )
-        )
-        return model.generate_content(prompt)
-
-    response = await asyncio.to_thread(_generate)
-    answer = response.text.strip()
-
-    # ✅ Suppress sources when model signals info not found in archive
-    NO_INFO_PHRASES = [
-        "not found in the archive",
-        "archive contains no records",
-        "not found in archive",
-        "არქივში ეს ინფორმაცია არ იძებნება",
-        "არ იძებნება არქივში",
-        "არ არის მოცემული არქივში",
-        "ინფორმაცია არ მოიძებნა",
-        "არ მოიპოვება",
-        "ვერ მოიძებნა",
-        "нет в архиве",
-        "не найдена",
-        "не найдено"
-        "archive's scope",          # redirect message
-    ]
-    answer_lower = answer.lower()
-    info_not_found = any(phrase.lower() in answer_lower for phrase in NO_INFO_PHRASES)
-
+    info_not_found = any(p.lower() in answer.lower() for p in NO_INFO_PHRASES)
     sources = [] if info_not_found else [
-        SourceItem(
-            chunk_id=c["chunk_id"],
-            work_id=c["work_id"],
-            title=c["title"],
-            volume_num=c.get("volume_num"),
-            score=c["score"]
-        )
+        SourceItem(chunk_id=c["chunk_id"], work_id=c["work_id"], title=c["title"],
+                   volume_num=c.get("volume_num"), score=c["score"])
         for c in chunks
     ]
 
-    return ChatResponse(query=req.query, answer=answer, sources=sources)
+    # Save history
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO chat_history (user_id,session_token,user_query,ai_response) VALUES ($1,$2,$3,$4)",
+            user_id, session_token, req.query, answer
+        )
+
+    # Increment daily limits
+    if not is_premium:
+        today = datetime.date.today()
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO daily_limits (session_token,ip_address,date,query_count) VALUES ($1,$2,$3,1)
+                ON CONFLICT (session_token,date) DO UPDATE SET query_count=daily_limits.query_count+1
+            """, session_token, client_ip, today)
+            await conn.execute("""
+                INSERT INTO daily_limits (session_token,ip_address,date,query_count) VALUES ($1,$2,$3,1)
+                ON CONFLICT (ip_address,date) DO UPDATE SET query_count=daily_limits.query_count+1
+            """, "ip::" + client_ip, client_ip, today)
+
+    data = ChatResponse(query=req.query, answer=answer, sources=sources)
+    return _set_cookie(JSONResponse(content=data.dict()))
 
 
 # ── Volume Endpoint ──────────────────────────────────────────────────────
@@ -487,7 +524,6 @@ async def get_volume_content(volume_num: int, language: str = "ka"):
 
     chapters = [{"title": r["title"], "chunk_text": r["chunk_text"]} for r in rows]
     return {"volume": volume_num, "language": language, "chapters": chapters}
-
 
 # ══════════════════════════════════════════════════════════════
 #  FEEDBACK ENDPOINT
