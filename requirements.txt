@@ -3,3 +3,6 @@ uvicorn[standard]
 asyncpg
 google-generativeai
 python-dotenv
+passlib[bcrypt]
+python-jose[cryptography]
+email-validator
