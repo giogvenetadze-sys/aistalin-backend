@@ -270,8 +270,11 @@ async def forgot_password(req: ForgotPasswordRequest):
 
     reset_link = f"{FRONTEND_URL}/?reset={token}"
 
-    if SMTP_USER and SMTP_PASS:
+    # Send email via Resend HTTP API (SMTP blocked on Railway hobby plan)
+    if RESEND_API_KEY:
         await asyncio.to_thread(_send_reset_email, row["email"], reset_link)
+    else:
+        print(f"⚠ RESEND_API_KEY not set. Add it in Railway Variables. Reset link: {reset_link}")
 
     print(f"✅ Reset token generated for {row['email']} | link: {reset_link}")
     return {"status": "ok"}
