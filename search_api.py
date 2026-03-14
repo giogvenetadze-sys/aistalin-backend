@@ -143,8 +143,18 @@ class LoginRequest(BaseModel):
 
 @app.post("/register", status_code=201)
 async def register(req: RegisterRequest, request: Request):
-    if len(req.password) < 8:
+    # ── Password length validation ────────────────────────────────────────
+    # Min: 8 chars. Max: 64 chars (bcrypt hard-limits at 72 BYTES;
+    # Georgian/Cyrillic chars are 2–3 bytes each in UTF-8, so 64 chars
+    # is the safe upper bound that guarantees we never exceed 72 bytes).
+    pw_bytes = req.password.encode("utf-8")
+    if len(pw_bytes) < 8:
         raise HTTPException(400, "Password must be at least 8 characters")
+    if len(pw_bytes) > 72:
+        raise HTTPException(
+            400,
+            "Password too long — maximum 72 characters (or fewer if using non-Latin letters)"
+        )
     pw_hash = pwd_context.hash(req.password)
     ip = request.headers.get("X-Forwarded-For", request.client.host or "Unknown").split(",")[0].strip()
     try:
