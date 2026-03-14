@@ -3,6 +3,7 @@
 # SYSTEM_INSTRUCTION, _generate(), RAG logic -- UNTOUCHED
 
 import os, asyncio, asyncpg, uuid, datetime, secrets
+import urllib.request, urllib.error, json as _json
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -276,48 +277,70 @@ async def forgot_password(req: ForgotPasswordRequest):
     return {"status": "ok"}
 
 
+# RESEND_API_KEY env var — get free key from resend.com (3000 emails/month free)
+# Railway hobby plan BLOCKS outbound SMTP (port 587/465) — HTTP API is the only option
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+RESEND_FROM    = os.getenv("RESEND_FROM", "AiStalin <noreply@aistalin.io>")
+
 def _send_reset_email(to_email: str, reset_link: str):
-    """Send password reset email. Runs in asyncio.to_thread."""
-    try:
-        html_body = f"""
-<html><body style="font-family:Georgia,serif;background:#1a0c04;color:#f5e6c8;padding:24px;">
+    """Send password reset email via Resend HTTP API (works on Railway hobby plan).
+    Railway blocks SMTP ports; HTTP API has no such restriction.
+    Get free API key at resend.com → 3000 emails/month free.
+    """
+    if not RESEND_API_KEY:
+        print(f"⚠ RESEND_API_KEY not set — reset link: {reset_link}")
+        return
+
+    html_body = f"""
+<html><body style="font-family:Georgia,serif;background:#1a0c04;color:#f5e6c8;padding:24px;max-width:560px;margin:0 auto;">
   <h2 style="color:#d4a017;border-bottom:1px solid #5c2d0f;padding-bottom:8px;">
     🔑 AiStalin.io — პაროლის განახლება
   </h2>
   <p style="margin-top:16px;">გამარჯობა,</p>
-  <p style="margin-top:8px;opacity:0.85;">
+  <p style="margin-top:8px;opacity:0.85;line-height:1.7;">
     მოვიდა მოთხოვნა თქვენი ანგარიშის პაროლის განახლებაზე.
     თუ ეს თქვენ გამოგზავნეთ, დააჭირეთ ღილაკს:
   </p>
   <div style="text-align:center;margin:32px 0;">
     <a href="{reset_link}"
-       style="background:linear-gradient(135deg,#d4a017,#a07810);
-              color:#1a0c04;padding:14px 32px;border-radius:6px;
-              text-decoration:none;font-weight:bold;font-size:1rem;
-              font-family:'Georgia',serif;">
+       style="background:#d4a017;color:#1a0c04;padding:14px 32px;
+              border-radius:6px;text-decoration:none;font-weight:bold;
+              font-size:1rem;font-family:Georgia,serif;display:inline-block;">
       პაროლის განახლება
     </a>
   </div>
-  <p style="opacity:0.65;font-size:0.85rem;">
-    ბმული მოქმედებს <strong>1 საათის</strong> განმავლობაში.
+  <p style="opacity:0.65;font-size:0.85rem;line-height:1.7;">
+    ბმული მოქმედებს <strong>1 საათის</strong> განმავლობაში.<br>
     თუ ეს მოთხოვნა არ გამოგზავნიათ, უბრალოდ უგულებელყავით ეს წერილი.
   </p>
-  <p style="opacity:0.4;font-size:0.75rem;margin-top:24px;border-top:1px solid #5c2d0f;padding-top:12px;">
+  <p style="opacity:0.35;font-size:0.75rem;margin-top:24px;border-top:1px solid #5c2d0f;padding-top:12px;">
     aistalin.io — სტალინის ციფრული არქივი
   </p>
 </body></html>"""
 
-        mail = MIMEMultipart("alternative")
-        mail["Subject"] = "[AiStalin] პაროლის განახლება"
-        mail["From"]    = SMTP_USER
-        mail["To"]      = to_email
-        mail.attach(MIMEText(html_body, "html", "utf-8"))
+    payload = _json.dumps({
+        "from":    RESEND_FROM,
+        "to":      [to_email],
+        "subject": "AiStalin — პაროლის განახლება",
+        "html":    html_body,
+    }).encode("utf-8")
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.ehlo(); server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, to_email, mail.as_string())
-        print(f"✅ Reset email sent to {to_email}")
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type":  "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = _json.loads(resp.read())
+            print(f"✅ Reset email sent via Resend to {to_email} | id: {result.get('id')}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        print(f"⚠ Resend error {e.code}: {body}")
     except Exception as e:
         print(f"⚠ Reset email failed: {e}")
 
