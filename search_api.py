@@ -27,8 +27,8 @@ JWT_EXPIRE_DAYS = 30
 EMBED_MODEL      = "models/gemini-embedding-001"
 TOP_K            = 10
 RRF_K            = 60
-VELOCITY_SECONDS = 5
-FREE_DAILY_LIMIT = 3
+VELOCITY_SECONDS = int(os.getenv("VELOCITY_SECONDS", "5"))
+FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "3"))
 COOKIE_NAME      = "aistalin_session"
 COOKIE_DAYS      = 365
 
@@ -42,18 +42,13 @@ NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "contact@aistalin.io")
 pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer(auto_error=False)
 
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "https://aistalin.io,https://www.aistalin.io,http://localhost:5500"
-).split(",")
-
 app = FastAPI(title="AiStalin Hybrid Search API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_origins=["*"],                       # ✅ works everywhere (HTTP+HTTPS)
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*", "X-Session-Token"],    # allow custom session header
+    expose_headers=["X-Session-Token"],        # frontend can read this from response
 )
 db_pool: asyncpg.Pool = None
 
@@ -387,10 +382,15 @@ async def chat(
     if req.language not in ["en", "ka", "ru"]:
         raise HTTPException(400, "language must be en/ka/ru")
 
-    # 1. Session token
-    session_token = request.cookies.get(COOKIE_NAME)
-    is_new_cookie = not bool(session_token)
-    if is_new_cookie:
+    # 1. Session token — header takes priority (works on HTTP+HTTPS)
+    #    Frontend stores it in localStorage and sends as X-Session-Token
+    session_token = (
+        request.headers.get("X-Session-Token") or   # from localStorage
+        request.cookies.get(COOKIE_NAME) or          # from HttpOnly cookie (HTTPS)
+        None
+    )
+    is_new_session = not bool(session_token)
+    if is_new_session:
         session_token = str(uuid.uuid4())
 
     # 2. Client IP
@@ -414,10 +414,20 @@ async def chat(
     is_premium = bool(current_user and current_user.get("is_premium"))
     user_id    = int(current_user["sub"]) if current_user else None
 
-    def _set_cookie(resp):
-        if is_new_cookie:
-            resp.set_cookie(key=COOKIE_NAME, value=session_token, httponly=True,
-                            secure=True, samesite="none", max_age=60*60*24*COOKIE_DAYS)
+    def _attach_session(resp, req=request):
+        # Always return session token in header (works HTTP + HTTPS)
+        resp.headers["X-Session-Token"] = session_token
+        resp.headers["Access-Control-Expose-Headers"] = "X-Session-Token"
+        # Also set cookie — secure only on HTTPS (auto-detected)
+        is_https = req.url.scheme == "https"
+        if is_new_session:
+            resp.set_cookie(
+                key=COOKIE_NAME, value=session_token,
+                httponly=True,
+                secure=is_https,                    # ✅ False on HTTP (dev), True on HTTPS (prod)
+                samesite="none" if is_https else "lax",
+                max_age=60 * 60 * 24 * COOKIE_DAYS
+            )
         return resp
 
     if not is_premium:
@@ -430,7 +440,7 @@ async def chat(
                 "SELECT query_count FROM daily_limits WHERE ip_address=$1 AND date=$2",
                 client_ip, today) or 0
         if ses_cnt >= FREE_DAILY_LIMIT or ip_cnt >= FREE_DAILY_LIMIT:
-            return _set_cookie(JSONResponse(
+            return _attach_session(JSONResponse(
                 content={"status": "limit_reached", "message": "Daily free limit reached. Please subscribe."},
                 status_code=200
             ))
@@ -486,7 +496,7 @@ async def chat(
             """, "ip::" + client_ip, client_ip, today)
 
     data = ChatResponse(query=req.query, answer=answer, sources=sources)
-    return _set_cookie(JSONResponse(content=data.dict()))
+    return _attach_session(JSONResponse(content=data.dict()))
 
 
 # ── Volume Endpoint ──────────────────────────────────────────────────────
