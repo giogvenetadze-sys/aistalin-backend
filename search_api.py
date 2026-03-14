@@ -2,7 +2,7 @@
 # v2.0: JWT auth, HttpOnly session tokens, velocity check, daily limits
 # SYSTEM_INSTRUCTION, _generate(), RAG logic -- UNTOUCHED
 
-import os, asyncio, asyncpg, uuid, datetime
+import os, asyncio, asyncpg, uuid, datetime, secrets
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -110,6 +110,16 @@ async def _create_tables():
         )""",
         """CREATE INDEX IF NOT EXISTS idx_daily_session ON daily_limits(session_token, date)""",
         """CREATE INDEX IF NOT EXISTS idx_daily_ip ON daily_limits(ip_address, date)""",
+        # Password reset tokens — 1-hour expiry, single-use
+        """CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            token TEXT NOT NULL UNIQUE,
+            expires_at TIMESTAMPTZ NOT NULL,
+            used BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_prt_token ON password_reset_tokens(token)""",
     ]
     async with db_pool.acquire() as conn:
         for s in stmts:
@@ -197,6 +207,149 @@ async def login(req: LoginRequest):
             is_premium = False
     return {"access_token": create_jwt(row["id"],row["email"],row["role"],is_premium),
             "token_type": "bearer", "is_premium": is_premium}
+
+
+# == PASSWORD RESET ENDPOINTS ==============================================
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://aistalin.io")
+
+@app.post("/forgot-password", status_code=200)
+async def forgot_password(req: ForgotPasswordRequest):
+    """
+    Generate a reset token and send an email with a reset link.
+    Always returns 200 — never reveals if the email exists (security).
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, email FROM users WHERE email=$1", req.email.lower()
+        )
+    if not row:
+        # Return success anyway — don't leak whether email is registered
+        return {"status": "ok"}
+
+    token = secrets.token_urlsafe(32)
+    expires = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+
+    async with db_pool.acquire() as conn:
+        # Invalidate any previous unused tokens for this user
+        await conn.execute(
+            "UPDATE password_reset_tokens SET used=TRUE WHERE user_id=$1 AND used=FALSE",
+            row["id"]
+        )
+        await conn.execute(
+            "INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)",
+            row["id"], token, expires
+        )
+
+    reset_link = f"{FRONTEND_URL}/?reset={token}"
+
+    if SMTP_USER and SMTP_PASS:
+        await asyncio.to_thread(_send_reset_email, row["email"], reset_link)
+
+    print(f"✅ Reset token generated for {row['email']} | link: {reset_link}")
+    return {"status": "ok"}
+
+
+def _send_reset_email(to_email: str, reset_link: str):
+    """Send password reset email. Runs in asyncio.to_thread."""
+    try:
+        html_body = f"""
+<html><body style="font-family:Georgia,serif;background:#1a0c04;color:#f5e6c8;padding:24px;">
+  <h2 style="color:#d4a017;border-bottom:1px solid #5c2d0f;padding-bottom:8px;">
+    🔑 AiStalin.io — პაროლის განახლება
+  </h2>
+  <p style="margin-top:16px;">გამარჯობა,</p>
+  <p style="margin-top:8px;opacity:0.85;">
+    მოვიდა მოთხოვნა თქვენი ანგარიშის პაროლის განახლებაზე.
+    თუ ეს თქვენ გამოგზავნეთ, დააჭირეთ ღილაკს:
+  </p>
+  <div style="text-align:center;margin:32px 0;">
+    <a href="{reset_link}"
+       style="background:linear-gradient(135deg,#d4a017,#a07810);
+              color:#1a0c04;padding:14px 32px;border-radius:6px;
+              text-decoration:none;font-weight:bold;font-size:1rem;
+              font-family:'Georgia',serif;">
+      პაროლის განახლება
+    </a>
+  </div>
+  <p style="opacity:0.65;font-size:0.85rem;">
+    ბმული მოქმედებს <strong>1 საათის</strong> განმავლობაში.
+    თუ ეს მოთხოვნა არ გამოგზავნიათ, უბრალოდ უგულებელყავით ეს წერილი.
+  </p>
+  <p style="opacity:0.4;font-size:0.75rem;margin-top:24px;border-top:1px solid #5c2d0f;padding-top:12px;">
+    aistalin.io — სტალინის ციფრული არქივი
+  </p>
+</body></html>"""
+
+        mail = MIMEMultipart("alternative")
+        mail["Subject"] = "[AiStalin] პაროლის განახლება"
+        mail["From"]    = SMTP_USER
+        mail["To"]      = to_email
+        mail.attach(MIMEText(html_body, "html", "utf-8"))
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.ehlo(); server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, to_email, mail.as_string())
+        print(f"✅ Reset email sent to {to_email}")
+    except Exception as e:
+        print(f"⚠ Reset email failed: {e}")
+
+
+@app.post("/reset-password", status_code=200)
+async def reset_password(req: ResetPasswordRequest):
+    """
+    Verify a reset token and update the user's password.
+    Token is single-use and expires after 1 hour.
+    """
+    # Byte-level password validation (bcrypt hard limit)
+    pw_bytes = req.new_password.encode("utf-8")
+    if len(pw_bytes) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    if len(pw_bytes) > 72:
+        raise HTTPException(400, "Password too long (max 72 bytes)")
+
+    now = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT prt.id, prt.user_id, prt.expires_at, prt.used
+               FROM password_reset_tokens prt
+               WHERE prt.token = $1""",
+            req.token
+        )
+
+    if not row:
+        raise HTTPException(400, "Invalid reset link — request a new one")
+    if row["used"]:
+        raise HTTPException(400, "This link has already been used")
+
+    expires = row["expires_at"]
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=datetime.timezone.utc)
+    if expires < now:
+        raise HTTPException(400, "Reset link expired — request a new one")
+
+    new_hash = _hash_password(req.new_password)
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET password_hash=$1 WHERE id=$2",
+            new_hash, row["user_id"]
+        )
+        await conn.execute(
+            "UPDATE password_reset_tokens SET used=TRUE WHERE id=$1",
+            row["id"]
+        )
+
+    print(f"✅ Password reset for user_id={row['user_id']}")
+    return {"status": "ok", "message": "Password updated successfully"}
 
 
 # == SEARCH MODELS ===========================================================
