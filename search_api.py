@@ -283,7 +283,10 @@ async def forgot_password(req: ForgotPasswordRequest):
 # RESEND_API_KEY env var — get free key from resend.com (3000 emails/month free)
 # Railway hobby plan BLOCKS outbound SMTP (port 587/465) — HTTP API is the only option
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-RESEND_FROM    = os.getenv("RESEND_FROM", "AiStalin <noreply@aistalin.io>")
+RESEND_FROM    = os.getenv("RESEND_FROM", "onboarding@resend.dev")
+# NOTE: "onboarding@resend.dev" works without domain verification (Resend test address).
+# Once you verify aistalin.io in Resend dashboard → Domains, 
+# set Railway var: RESEND_FROM=AiStalin <noreply@aistalin.io>
 
 def _send_reset_email(to_email: str, reset_link: str):
     """Send password reset email via Resend HTTP API (works on Railway hobby plan).
@@ -343,9 +346,10 @@ def _send_reset_email(to_email: str, reset_link: str):
             print(f"✅ Reset email sent via Resend to {to_email} | id: {result.get('id')}")
     except urllib.error.HTTPError as e:
         body = e.read().decode()
-        print(f"⚠ Resend error {e.code}: {body}")
+        print(f"⚠ Resend HTTP error {e.code}: {body}")
+        print(f"⚠ Check: is RESEND_FROM a verified domain? Use 'onboarding@resend.dev' for testing.")
     except Exception as e:
-        print(f"⚠ Reset email failed: {e}")
+        print(f"⚠ Reset email failed: {type(e).__name__}: {e}")
 
 
 @app.post("/reset-password", status_code=200)
