@@ -14,7 +14,7 @@ from typing import Optional
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from passlib.context import CryptContext
+import bcrypt as _bcrypt  # Direct bcrypt — no passlib (passlib incompatible with Python 3.13)
 from jose import JWTError, jwt
 
 load_dotenv()
@@ -39,7 +39,18 @@ SMTP_USER    = os.getenv("SMTP_USER", "")
 SMTP_PASS    = os.getenv("SMTP_PASS", "")
 NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "contact@aistalin.io")
 
-pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# ── Password hashing — direct bcrypt (rounds=12, work factor) ────────────
+def _hash_password(password: str) -> str:
+    """Hash a password with bcrypt. Input validated to ≤72 bytes before call."""
+    salt = _bcrypt.gensalt(rounds=12)
+    return _bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    """Constant-time bcrypt verify. Returns False on any error."""
+    try:
+        return _bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
 bearer_scheme = HTTPBearer(auto_error=False)
 
 app = FastAPI(title="AiStalin Hybrid Search API", version="2.0.0")
@@ -143,17 +154,17 @@ class LoginRequest(BaseModel):
 
 @app.post("/register", status_code=201)
 async def register(req: RegisterRequest, request: Request):
-    # ── bcrypt hard-limits at 72 BYTES (not chars!)
-    # Georgian/Cyrillic chars are 2-3 bytes in UTF-8, so we check bytes.
+    # ── Byte-level validation (bcrypt hard-limit = 72 bytes, not chars) ──
+    # Georgian/Cyrillic chars = 2-3 bytes in UTF-8, so we MUST check bytes.
     pw_bytes = req.password.encode("utf-8")
     if len(pw_bytes) < 8:
         raise HTTPException(400, "Password must be at least 8 characters")
     if len(pw_bytes) > 72:
         raise HTTPException(
             400,
-            "Password too long — use Latin characters (max 72 bytes; Georgian chars count as 3 bytes each)"
+            "Password too long — use Latin characters (bcrypt max = 72 bytes; Georgian chars = 3 bytes each)"
         )
-    pw_hash = pwd_context.hash(req.password)
+    pw_hash = _hash_password(req.password)
     ip = request.headers.get("X-Forwarded-For", request.client.host or "Unknown").split(",")[0].strip()
     try:
         async with db_pool.acquire() as conn:
@@ -173,7 +184,7 @@ async def login(req: LoginRequest):
             "SELECT id,email,password_hash,role,is_premium,premium_until FROM users WHERE email=$1",
             req.email.lower()
         )
-    if not row or not pwd_context.verify(req.password, row["password_hash"]):
+    if not row or not _verify_password(req.password, row["password_hash"]):
         raise HTTPException(401, "Invalid email or password")
     is_premium = row["is_premium"]
     if is_premium and row["premium_until"]:
