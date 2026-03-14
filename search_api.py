@@ -120,6 +120,26 @@ async def _create_tables():
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""",
         """CREATE INDEX IF NOT EXISTS idx_prt_token ON password_reset_tokens(token)""",
+
+        # User bookmarks — up to 7 for free, unlimited for premium
+        """CREATE TABLE IF NOT EXISTS user_bookmarks (
+            id          SERIAL PRIMARY KEY,
+            user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title       TEXT NOT NULL,
+            volume_num  INTEGER,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (user_id, title, volume_num)
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_bk_user ON user_bookmarks(user_id)""",
+
+        # User notes — simple text entries, date-stamped
+        """CREATE TABLE IF NOT EXISTS user_notes (
+            id         SERIAL PRIMARY KEY,
+            user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            note_text  TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_notes_user ON user_notes(user_id, created_at DESC)""",
     ]
     async with db_pool.acquire() as conn:
         for s in stmts:
@@ -350,6 +370,131 @@ async def reset_password(req: ResetPasswordRequest):
 
     print(f"✅ Password reset for user_id={row['user_id']}")
     return {"status": "ok", "message": "Password updated successfully"}
+
+
+# == BOOKMARKS ENDPOINTS ====================================================
+FREE_BK_LIMIT = 7   # free users; premium = unlimited
+
+class BookmarkIn(BaseModel):
+    title:      str
+    volume_num: Optional[int] = None
+
+@app.get("/bookmarks")
+async def list_bookmarks(user: dict = Depends(get_current_user)):
+    if not user:
+        raise HTTPException(401, "Login required")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, title, volume_num, created_at FROM user_bookmarks "
+            "WHERE user_id=$1 ORDER BY created_at DESC",
+            int(user["sub"])
+        )
+    return {"bookmarks": [
+        {"id": r["id"], "title": r["title"],
+         "volume_num": r["volume_num"],
+         "date": r["created_at"].strftime("%d %b %Y")}
+        for r in rows
+    ]}
+
+@app.post("/bookmarks", status_code=201)
+async def add_bookmark(bk: BookmarkIn, user: dict = Depends(get_current_user)):
+    if not user:
+        raise HTTPException(401, "Login required")
+    uid = int(user["sub"])
+    is_premium = user.get("is_premium", False)
+
+    async with db_pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_bookmarks WHERE user_id=$1", uid
+        )
+        if not is_premium and count >= FREE_BK_LIMIT:
+            raise HTTPException(403, f"Bookmark limit reached ({FREE_BK_LIMIT}/7). Upgrade to Premium.")
+        try:
+            row = await conn.fetchrow(
+                "INSERT INTO user_bookmarks (user_id, title, volume_num) "
+                "VALUES ($1,$2,$3) RETURNING id, created_at",
+                uid, bk.title.strip(), bk.volume_num
+            )
+        except Exception:
+            raise HTTPException(409, "Already bookmarked")
+    return {"id": row["id"], "date": row["created_at"].strftime("%d %b %Y")}
+
+@app.delete("/bookmarks/{bk_id}", status_code=200)
+async def delete_bookmark(bk_id: int, user: dict = Depends(get_current_user)):
+    if not user:
+        raise HTTPException(401, "Login required")
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM user_bookmarks WHERE id=$1 AND user_id=$2",
+            bk_id, int(user["sub"])
+        )
+    if result == "DELETE 0":
+        raise HTTPException(404, "Bookmark not found")
+    return {"status": "deleted"}
+
+
+# == NOTES ENDPOINTS =========================================================
+NOTE_MAX = 30
+
+class NoteIn(BaseModel):
+    note_text: str
+
+@app.get("/notes")
+async def list_notes(user: dict = Depends(get_current_user)):
+    if not user:
+        raise HTTPException(401, "Login required")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, note_text, created_at FROM user_notes "
+            "WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2",
+            int(user["sub"]), NOTE_MAX
+        )
+    return {"notes": [
+        {"id": r["id"], "text": r["note_text"],
+         "date": r["created_at"].strftime("%d %b %Y · %H:%M")}
+        for r in rows
+    ]}
+
+@app.post("/notes", status_code=201)
+async def add_note(note: NoteIn, user: dict = Depends(get_current_user)):
+    if not user:
+        raise HTTPException(401, "Login required")
+    text = note.note_text.strip()
+    if not text:
+        raise HTTPException(400, "Note cannot be empty")
+    if len(text) > 5000:
+        raise HTTPException(400, "Note too long (max 5000 chars)")
+    uid = int(user["sub"])
+    async with db_pool.acquire() as conn:
+        # Auto-trim oldest if over limit
+        count = await conn.fetchval(
+            "SELECT COUNT(*) FROM user_notes WHERE user_id=$1", uid
+        )
+        if count >= NOTE_MAX:
+            await conn.execute(
+                "DELETE FROM user_notes WHERE id = ("
+                "SELECT id FROM user_notes WHERE user_id=$1 "
+                "ORDER BY created_at ASC LIMIT 1)", uid
+            )
+        row = await conn.fetchrow(
+            "INSERT INTO user_notes (user_id, note_text) VALUES ($1,$2) "
+            "RETURNING id, created_at",
+            uid, text
+        )
+    return {"id": row["id"], "date": row["created_at"].strftime("%d %b %Y · %H:%M")}
+
+@app.delete("/notes/{note_id}", status_code=200)
+async def delete_note(note_id: int, user: dict = Depends(get_current_user)):
+    if not user:
+        raise HTTPException(401, "Login required")
+    async with db_pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM user_notes WHERE id=$1 AND user_id=$2",
+            note_id, int(user["sub"])
+        )
+    if result == "DELETE 0":
+        raise HTTPException(404, "Note not found")
+    return {"status": "deleted"}
 
 
 # == SEARCH MODELS ===========================================================
