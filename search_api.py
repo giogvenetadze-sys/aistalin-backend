@@ -90,10 +90,12 @@ async def _create_tables():
         """CREATE INDEX IF NOT EXISTS idx_chat_session
             ON chat_history(session_token, created_at DESC)""",
         """CREATE TABLE IF NOT EXISTS daily_limits (
-            id SERIAL PRIMARY KEY, session_token TEXT NOT NULL,
-            ip_address TEXT NOT NULL, date DATE NOT NULL DEFAULT CURRENT_DATE,
-            query_count INT NOT NULL DEFAULT 1,
-            UNIQUE (session_token, date), UNIQUE (ip_address, date)
+            id SERIAL PRIMARY KEY,
+            session_token TEXT NOT NULL,
+            ip_address    TEXT NOT NULL,
+            date          DATE NOT NULL DEFAULT CURRENT_DATE,
+            query_count   INT  NOT NULL DEFAULT 1,
+            UNIQUE (session_token, date)
         )""",
         """CREATE INDEX IF NOT EXISTS idx_daily_session ON daily_limits(session_token, date)""",
         """CREATE INDEX IF NOT EXISTS idx_daily_ip ON daily_limits(ip_address, date)""",
@@ -433,11 +435,13 @@ async def chat(
     if not is_premium:
         today = datetime.date.today()
         async with db_pool.acquire() as conn:
+            # session count — exact match on session_token+date
             ses_cnt = await conn.fetchval(
                 "SELECT query_count FROM daily_limits WHERE session_token=$1 AND date=$2",
                 session_token, today) or 0
+            # IP count — sum across ALL sessions from this IP today
             ip_cnt = await conn.fetchval(
-                "SELECT query_count FROM daily_limits WHERE ip_address=$1 AND date=$2",
+                "SELECT COALESCE(SUM(query_count),0) FROM daily_limits WHERE ip_address=$1 AND date=$2",
                 client_ip, today) or 0
         if ses_cnt >= FREE_DAILY_LIMIT or ip_cnt >= FREE_DAILY_LIMIT:
             return _attach_session(JSONResponse(
@@ -482,18 +486,17 @@ async def chat(
             user_id, session_token, req.query, answer
         )
 
-    # Increment daily limits
+    # Increment daily limits — single row per (session_token, date)
+    # IP is stored in the same row; SUM(query_count) WHERE ip_address=X gives total per IP
     if not is_premium:
         today = datetime.date.today()
         async with db_pool.acquire() as conn:
             await conn.execute("""
-                INSERT INTO daily_limits (session_token,ip_address,date,query_count) VALUES ($1,$2,$3,1)
-                ON CONFLICT (session_token,date) DO UPDATE SET query_count=daily_limits.query_count+1
+                INSERT INTO daily_limits (session_token, ip_address, date, query_count)
+                VALUES ($1, $2, $3, 1)
+                ON CONFLICT (session_token, date)
+                DO UPDATE SET query_count = daily_limits.query_count + 1
             """, session_token, client_ip, today)
-            await conn.execute("""
-                INSERT INTO daily_limits (session_token,ip_address,date,query_count) VALUES ($1,$2,$3,1)
-                ON CONFLICT (ip_address,date) DO UPDATE SET query_count=daily_limits.query_count+1
-            """, "ip::" + client_ip, client_ip, today)
 
     data = ChatResponse(query=req.query, answer=answer, sources=sources)
     return _attach_session(JSONResponse(content=data.dict()))
