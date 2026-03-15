@@ -3,6 +3,8 @@
 # SYSTEM_INSTRUCTION, _generate(), RAG logic -- UNTOUCHED
 
 import os, asyncio, asyncpg, uuid, datetime, secrets
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
 import urllib.request, urllib.error, json as _json
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
@@ -23,6 +25,7 @@ load_dotenv()
 DATABASE_URL    = os.getenv("DATABASE_URL")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
 JWT_SECRET      = os.getenv("JWT_SECRET", "change-this-in-production")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")  # Get from Google Cloud Console → APIs & Services → Credentials
 JWT_ALGORITHM   = "HS256"
 JWT_EXPIRE_DAYS = 30
 EMBED_MODEL      = "models/gemini-embedding-001"
@@ -228,6 +231,84 @@ async def login(req: LoginRequest):
             is_premium = False
     return {"access_token": create_jwt(row["id"],row["email"],row["role"],is_premium),
             "token_type": "bearer", "is_premium": is_premium}
+
+
+
+# == GOOGLE SSO ENDPOINT ====================================================
+class GoogleAuthRequest(BaseModel):
+    credential: str  # Google Identity Services JWT token
+
+@app.post("/auth/google", status_code=200)
+async def auth_google(req: GoogleAuthRequest, request: Request):
+    """
+    Verify a Google Identity Services JWT token.
+    - If email exists in DB → return our app JWT (login)
+    - If email is new      → create user, return JWT (register)
+    No password needed — Google has already authenticated the user.
+    """
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(500, "Google OAuth not configured (GOOGLE_CLIENT_ID missing)")
+
+    # ── 1. Verify the Google token ─────────────────────────────────────────
+    try:
+        id_info = google_id_token.verify_oauth2_token(
+            req.credential,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+            clock_skew_in_seconds=10,  # tolerate slight clock drift
+        )
+    except ValueError as e:
+        raise HTTPException(401, f"Invalid Google token: {e}")
+
+    email = id_info.get("email", "").lower()
+    if not email:
+        raise HTTPException(400, "Google token does not contain an email")
+
+    # ── 2. Check if user exists, else create ───────────────────────────────
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, email, role, is_premium, premium_until FROM users WHERE email=$1",
+            email
+        )
+
+        if row is None:
+            # New user — insert with google_sso placeholder password
+            ip = request.headers.get(
+                "X-Forwarded-For", request.client.host or "Unknown"
+            ).split(",")[0].strip()
+            row = await conn.fetchrow(
+                "INSERT INTO users (email, password_hash, ip_address) "
+                "VALUES ($1, 'google_sso', $2) "
+                "RETURNING id, email, role, is_premium",
+                email, ip
+            )
+            is_new = True
+        else:
+            is_new = False
+
+    # ── 3. Handle premium expiry (same logic as /login) ────────────────────
+    is_premium = row["is_premium"]
+    if not is_new and is_premium and row.get("premium_until"):
+        pu = row["premium_until"]
+        if pu.tzinfo is None:
+            pu = pu.replace(tzinfo=datetime.timezone.utc)
+        if pu < datetime.datetime.now(datetime.timezone.utc):
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE users SET is_premium=FALSE WHERE id=$1", row["id"]
+                )
+            is_premium = False
+
+    # ── 4. Return our app JWT ───────────────────────────────────────────────
+    token = create_jwt(row["id"], row["email"], row["role"], is_premium)
+    print(f"{'🆕' if is_new else '✅'} Google SSO: {email} | new={is_new}")
+
+    return {
+        "access_token": token,
+        "token_type":   "bearer",
+        "is_premium":   is_premium,
+        "is_new_user":  is_new,  # frontend can show welcome modal for new users
+    }
 
 
 # == PASSWORD RESET ENDPOINTS ==============================================
