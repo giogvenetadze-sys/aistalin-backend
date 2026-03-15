@@ -283,15 +283,35 @@ async def forgot_password(req: ForgotPasswordRequest):
 # RESEND_API_KEY env var — get free key from resend.com (3000 emails/month free)
 # Railway hobby plan BLOCKS outbound SMTP (port 587/465) — HTTP API is the only option
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-RESEND_FROM    = os.getenv("RESEND_FROM", "onboarding@resend.dev")
-# NOTE: "onboarding@resend.dev" works without domain verification (Resend test address).
-# Once you verify aistalin.io in Resend dashboard → Domains, 
-# set Railway var: RESEND_FROM=AiStalin <noreply@aistalin.io>
+RESEND_FROM    = os.getenv("RESEND_FROM", "AiStalin <noreply@aistalin.io>")
+
+def _resend_post(from_addr: str, to_email: str, subject: str, html_body: str) -> dict:
+    """Make one POST to Resend API. Returns response dict or raises urllib.error.HTTPError."""
+    payload = _json.dumps({
+        "from":    from_addr,
+        "to":      [to_email],
+        "subject": subject,
+        "html":    html_body,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type":  "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return _json.loads(resp.read())
+
 
 def _send_reset_email(to_email: str, reset_link: str):
-    """Send password reset email via Resend HTTP API (works on Railway hobby plan).
-    Railway blocks SMTP ports; HTTP API has no such restriction.
-    Get free API key at resend.com → 3000 emails/month free.
+    """Send password reset email via Resend HTTP API.
+    Strategy:
+      1. Try RESEND_FROM (custom domain, e.g. noreply@aistalin.io)
+      2. If error 1010 (domain not verified for this API key), 
+         auto-fallback to onboarding@resend.dev — always works.
     """
     if not RESEND_API_KEY:
         print(f"⚠ RESEND_API_KEY not set — reset link: {reset_link}")
@@ -324,32 +344,29 @@ def _send_reset_email(to_email: str, reset_link: str):
   </p>
 </body></html>"""
 
-    payload = _json.dumps({
-        "from":    RESEND_FROM,
-        "to":      [to_email],
-        "subject": "AiStalin — პაროლის განახლება",
-        "html":    html_body,
-    }).encode("utf-8")
+    subject = "AiStalin — პაროლის განახლება"
 
-    req = urllib.request.Request(
-        "https://api.resend.com/emails",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type":  "application/json",
-        },
-        method="POST",
-    )
+    # Attempt 1: Try configured RESEND_FROM (custom domain noreply@aistalin.io)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = _json.loads(resp.read())
-            print(f"✅ Reset email sent via Resend to {to_email} | id: {result.get('id')}")
+        result = _resend_post(RESEND_FROM, to_email, subject, html_body)
+        print(f"✅ Email sent ({RESEND_FROM}) → {to_email} | id: {result.get('id')}")
+        return
     except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        print(f"⚠ Resend HTTP error {e.code}: {body}")
-        print(f"⚠ Check: is RESEND_FROM a verified domain? Use 'onboarding@resend.dev' for testing.")
+        raw = e.read().decode()
+        # Error 1010 = "from" domain not verified for this API key scope
+        # Auto-fallback to Resend built-in test address — works with ANY valid key
+        if e.code == 403 and "1010" in raw:
+            print(f"⚠ 1010: domain not authorized for this key → fallback to onboarding@resend.dev")
+            try:
+                result = _resend_post("onboarding@resend.dev", to_email, subject, html_body)
+                print(f"✅ Email sent (onboarding@resend.dev) → {to_email} | id: {result.get('id')}")
+                return
+            except Exception as e2:
+                print(f"⚠ Fallback failed: {e2}")
+        else:
+            print(f"⚠ Resend error {e.code}: {raw}")
     except Exception as e:
-        print(f"⚠ Reset email failed: {type(e).__name__}: {e}")
+        print(f"⚠ Email failed: {type(e).__name__}: {e}")
 
 
 @app.post("/reset-password", status_code=200)
