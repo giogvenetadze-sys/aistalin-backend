@@ -9,7 +9,7 @@ import urllib.request, urllib.error, json as _json
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
@@ -32,6 +32,10 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")  # Get from Google Cloud Co
 PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "")  # Notification secret key
 PADDLE_PRICE_ID       = os.getenv("PADDLE_PRICE_ID", "")        # pri_xxxx — your $5/mo price
 PADDLE_ENV            = os.getenv("PADDLE_ENV", "sandbox")       # "sandbox" | "production"
+
+# ── Admin access ─────────────────────────────────────────────────────────────
+# Only this email can access future admin endpoints (e.g. /admin/*)
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "")  # Set in Railway Variables
 JWT_ALGORITHM   = "HS256"
 JWT_EXPIRE_DAYS = 30
 EMBED_MODEL      = "models/gemini-embedding-001"
@@ -847,6 +851,214 @@ async def delete_note(note_id: int, user: dict = Depends(get_current_user)):
     if result == "DELETE 0":
         raise HTTPException(404, "Note not found")
     return {"status": "deleted"}
+
+
+
+# ── Admin guard dependency ─────────────────────────────────────────────────
+async def require_admin(user: dict = Depends(get_current_user)) -> dict:
+    """Dependency that allows only ADMIN_EMAIL through.
+    Usage: @app.get("/admin/...") async def handler(admin=Depends(require_admin))
+    """
+    if not user:
+        raise HTTPException(401, "Authentication required")
+    if not ADMIN_EMAIL:
+        raise HTTPException(503, "Admin not configured (ADMIN_EMAIL env var missing)")
+    if user.get("email", "").lower() != ADMIN_EMAIL.lower():
+        raise HTTPException(403, "Admin access only")
+    return user
+
+
+# == LEGAL PAGES (HTML) ======================================================
+# Self-contained HTML pages served directly by the API.
+# No separate static file server needed — works on Railway as-is.
+
+_LEGAL_CSS = """
+  body{margin:0;background:#0d0603;color:#d8c9a8;font-family:'Georgia',serif;line-height:1.85}
+  .wrap{max-width:760px;margin:0 auto;padding:3rem 1.5rem 5rem}
+  h1{font-family:'Playfair Display',serif;font-size:2rem;color:#d4a017;
+     border-bottom:1px solid rgba(92,45,15,.5);padding-bottom:.75rem;margin-bottom:2rem}
+  h2{font-family:'Playfair Display',serif;font-size:1.15rem;color:#c8941a;margin-top:2rem}
+  p,li{font-size:.97rem;opacity:.88}
+  ul{padding-left:1.5rem}
+  a{color:#d4a017;text-decoration:none}a:hover{text-decoration:underline}
+  .back{display:inline-block;margin-bottom:2rem;font-size:.85rem;
+        padding:.45rem 1rem;border:1px solid rgba(92,45,15,.6);
+        border-radius:4px;color:rgba(212,184,150,.7);transition:all .2s}
+  .back:hover{border-color:#d4a017;color:#d4a017}
+  .footer-links{margin-top:3rem;padding-top:1rem;
+    border-top:1px solid rgba(92,45,15,.4);font-size:.8rem;
+    opacity:.55;display:flex;gap:1.5rem;flex-wrap:wrap}
+  .footer-links a{color:rgba(212,184,150,.7)}
+  strong{color:#e0c880}
+"""
+
+def _legal_page(title: str, body_html: str) -> str:
+    return f"""<!doctype html><html lang="ka"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} — AiStalin.io</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&family=Cormorant+Garamond:ital,wght@0,400;1,400&display=swap" rel="stylesheet">
+<style>{_LEGAL_CSS}</style>
+</head><body><div class="wrap">
+<a href="https://aistalin.io" class="back">&#8592; AiStalin.io</a>
+{body_html}
+<div class="footer-links">
+  <a href="/terms">მომსახურების პირობები</a>
+  <a href="/privacy">კონფიდენციალურობა</a>
+  <a href="/refund">თანხის დაბრუნება</a>
+  <a href="mailto:contact@aistalin.io">contact@aistalin.io</a>
+</div>
+</div></body></html>"""
+
+
+@app.get("/terms", response_class=HTMLResponse)
+async def terms_page():
+    body = """
+<h1>მომსახურების პირობები</h1>
+<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">ბოლო განახლება: 2025 წელი</p>
+
+<p>კეთილი იყოს თქვენი მობრძანება AiStalin-ზე. ამ ვებსაიტისა და მასთან დაკავშირებული სერვისების გამოყენებით თქვენ ეთანხმებით ქვემოთ მოცემულ პირობებს. თუ ამ პირობებს არ ეთანხმებით, გთხოვთ არ გამოიყენოთ ჩვენი სერვისი.</p>
+
+<h2>1. სერვისის აღწერა</h2>
+<p>AiStalin წარმოადგენს ონლაინ ისტორიულ ბიბლიოთეკასა და AI-ზე დაფუძნებულ საძიებო პლატფორმას. სისტემა მომხმარებლებს აძლევს შესაძლებლობას:</p>
+<ul><li>დაათვალიერონ ისტორიული ტექსტები</li>
+<li>გამოიყენონ უფასო საძიებო სისტემა</li>
+<li>გამოიყენონ AI ჩატი ტექსტების მოძებნაში</li></ul>
+<p>სერვისის ნაწილი ხელმისაწვდომია უფასოდ, ხოლო AI ჩატის სრული ფუნქციონალი ხელმისაწვდომია პრემიუმ წევრობის ფარგლებში.</p>
+
+<h2>2. კონტენტის წყაროები</h2>
+<p>ვებსაიტზე ხელმისაწვდომი ისტორიული ტექსტები აღებულია საჯარო არქივებიდან:</p>
+<ul><li><strong>Marxists Internet Archive</strong> (marxists.org)</li>
+<li><strong>RevolutionaryDemocracy.org</strong></li></ul>
+<p>AiStalin არ აცხადებს საკუთრების უფლებას ამ ტექსტებზე. პლატფორმა წარმოადგენს ტექნოლოგიურ ინსტრუმენტს ამ არქივებში მასალის მოძიებისთვის.</p>
+
+<h2>3. ტექსტების გამოყენება</h2>
+<p>ამ არქივებიდან მიღებული მასალები გავრცელებულია თავისუფლად. მომხმარებლებს შეუძლიათ ტექსტების კითხვა, ციტირება და კოპირება იმ პირობებით, რომლებიც დაშვებულია ორიგინალი არქივების მიერ.</p>
+
+<h2>4. ანგარიშის შექმნა</h2>
+<p>ზოგიერთი ფუნქციის გამოყენებისთვის შეიძლება საჭირო გახდეს ანგარიშის შექმნა. მომხმარებელი პასუხისმგებელია ანგარიშის ინფორმაციის სისწორეზე, პაროლის უსაფრთხოებაზე და ანგარიშის გამოყენებაზე.</p>
+
+<h2>5. გადახდები და გამოწერა</h2>
+<p>პლატფორმის ზოგიერთი ფუნქცია ხელმისაწვდომია ფასიანი გამოწერის საშუალებით. გადახდები მუშავდება მესამე მხარის გადახდის სისტემის — <strong>Paddle</strong>-ის მეშვეობით. გამოწერა შეიძლება განახლდეს ავტომატურად ბილინგის პერიოდის დასრულების შემდეგ.</p>
+
+<h2>6. AI პასუხები</h2>
+<p>AI ჩატი წარმოადგენს საინფორმაციო ინსტრუმენტს. პასუხები ეფუძნება ისტორიულ ტექსტებს, მაგრამ შეიძლება იყოს არასრული. მომხმარებელმა მნიშვნელოვანი გადაწყვეტილებები არ უნდა მიიღოს მხოლოდ ამ სისტემის პასუხებზე დაყრდნობით.</p>
+
+<h2>7. პასუხისმგებლობის შეზღუდვა</h2>
+<p>სერვისი მიეწოდება არსებული მდგომარეობით. AiStalin არ აგებს პასუხს არაპირდაპირ ან შემთხვევით ზიანზე სერვისის გამოყენების შედეგად.</p>
+
+<h2>8. ცვლილებები</h2>
+<p>ეს პირობები შეიძლება განახლდეს. განახლებული ვერსია გამოქვეყნდება ამ გვერდზე.</p>
+
+<h2>9. კონტაქტი</h2>
+<p><a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
+"""
+    return _legal_page("მომსახურების პირობები", body)
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy_page():
+    body = """
+<h1>კონფიდენციალურობის პოლიტიკა</h1>
+<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">ბოლო განახლება: 2025 წელი</p>
+
+<p>AiStalin პატივს სცემს მომხმარებლის კონფიდენციალურობას. ეს პოლიტიკა განმარტავს, რა მონაცემებს ვაგროვებთ და როგორ ვიყენებთ მათ.</p>
+
+<h2>1. რა მონაცემებს ვაგროვებთ</h2>
+<ul><li>ელფოსტა ანგარიშის შექმნისას</li>
+<li>ჩატის შეტყობინებები (სერვისის გაუმჯობესებისთვის)</li>
+<li>ტექნიკური მონაცემები (IP, ბრაუზერი, მოწყობილობა)</li>
+<li>სისტემის ლოგები უსაფრთხოების მიზნით</li></ul>
+
+<h2>2. როგორ ვიყენებთ მონაცემებს</h2>
+<ul><li>მომხმარებლის ანგარიშის სამართავად</li>
+<li>AI ჩატის ფუნქციონირებისთვის</li>
+<li>სისტემის გაუმჯობესებისთვის</li>
+<li>უსაფრთხოების მიზნით</li></ul>
+
+<h2>3. გადახდები</h2>
+<p>გადახდები მუშავდება <strong>Paddle</strong>-ის მიერ. ჩვენ არ ვინახავთ სრულ საბარათე მონაცემებს ჩვენს სისტემაში.</p>
+
+<h2>4. Cookies</h2>
+<p>ვებსაიტი იყენებს cookies ავტორიზაციისთვის, სესიის სამართავად და გამოცდილების გასაუმჯობესებლად.</p>
+
+<h2>5. მონაცემების გაზიარება</h2>
+<p>ჩვენ <strong>არ ვყიდით</strong> მომხმარებლის მონაცემებს. მონაცემები შეიძლება გაზიარდეს მხოლოდ ტექნიკურ სერვის პროვაიდერებთან ან კანონით მოთხოვნილ შემთხვევებში.</p>
+
+<h2>6. კონტენტის წყაროები</h2>
+<p>ვებსაიტზე წარმოდგენილი ისტორიული მასალა მიღებულია ღია არქივებიდან (<strong>Marxists Internet Archive</strong>, <strong>RevolutionaryDemocracy.org</strong>). ეს მასალები ხელმისაწვდომია თავისუფლად.</p>
+
+<h2>7. მონაცემების უსაფრთხოება</h2>
+<p>ვიყენებთ შესაბამის ტექნიკურ ზომებს (HTTPS, bcrypt password hashing, JWT tokens) მონაცემების დასაცავად.</p>
+
+<h2>8. ცვლილებები</h2>
+<p>ეს პოლიტიკა შეიძლება პერიოდულად განახლდეს.</p>
+
+<h2>9. კონტაქტი</h2>
+<p><a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
+"""
+    return _legal_page("კონფიდენციალურობის პოლიტიკა", body)
+
+
+@app.get("/refund", response_class=HTMLResponse)
+async def refund_page():
+    body = """
+<h1>თანხის დაბრუნების პოლიტიკა</h1>
+<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">ბოლო განახლება: 2025 წელი</p>
+
+<p>ეს პოლიტიკა განმარტავს თანხის დაბრუნებისა და გამოწერის გაუქმების წესებს AiStalin-ის ფასიანი სერვისებისთვის.</p>
+
+<h2>1. გამოწერის ტიპი</h2>
+<p>AiStalin გთავაზობთ <strong>$5/თვე</strong> პრემიუმ გამოწერას, რომელიც იძლევა AI ჩატზე ულიმიტო წვდომას. გადახდები მუშავდება <strong>Paddle</strong>-ის მეშვეობით.</p>
+
+<h2>2. გამოწერის გაუქმება</h2>
+<p>გამოწერის გასაუქმებლად:</p>
+<ul>
+  <li><strong>ვარიანტი 1:</strong> Paddle-ისგან მიღებული დადასტურების ელფოსტიდან → <em>"Manage Subscription"</em> ბმულზე დააჭირეთ</li>
+  <li><strong>ვარიანტი 2:</strong> მოგვწერეთ <a href="mailto:contact@aistalin.io">contact@aistalin.io</a>-ზე გამოწერის გაუქმების მოთხოვნით</li>
+</ul>
+<p>მიმდინარე ბილინგის პერიოდი ძალაში რჩება მის დასრულებამდე.</p>
+
+<h2>3. თანხის დაბრუნების წესი</h2>
+<p>ციფრული სერვისის ბუნებიდან გამომდინარე, უკვე დაწყებული ბილინგის პერიოდის თანხა, როგორც წესი, არ ბრუნდება.</p>
+
+<h2>4. გამონაკლისები</h2>
+<p>თანხის დაბრუნება შეიძლება განხილული იყოს შემდეგ შემთხვევებში:</p>
+<ul>
+  <li>დუბლირებული გადახდა</li>
+  <li>ტექნიკური შეცდომით არასწორი ჩამოჭრა</li>
+  <li>სერვისის ხანგრძლივი ტექნიკური გაუმართაობა</li>
+</ul>
+
+<h2>5. მოთხოვნის გაგზავნა</h2>
+<p>თანხის დაბრუნების განსახილველად მოგვწერეთ: <a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
+<p>მოთხოვნაში მიუთითეთ: თქვენი ელფოსტა, გადახდის თარიღი, პრობლემის აღწერა.</p>
+"""
+    return _legal_page("თანხის დაბრუნების პოლიტიკა", body)
+
+
+# == ADMIN ENDPOINTS (future) ================================================
+# Scaffold only — expand as needed.
+# All endpoints here require ADMIN_EMAIL via require_admin dependency.
+
+@app.get("/admin/stats")
+async def admin_stats(admin: dict = Depends(require_admin)):
+    """Basic platform statistics — admin only."""
+    async with db_pool.acquire() as conn:
+        user_count    = await conn.fetchval("SELECT COUNT(*) FROM users")
+        premium_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_premium=TRUE")
+        chat_today    = await conn.fetchval(
+            "SELECT COUNT(*) FROM chat_history WHERE created_at::date = CURRENT_DATE"
+        )
+        tx_total      = await conn.fetchval(
+            "SELECT COALESCE(SUM(amount_usd),0) FROM paddle_transactions WHERE status='premium_granted'"
+        )
+    return {
+        "users_total":     user_count,
+        "users_premium":   premium_count,
+        "chats_today":     chat_today,
+        "revenue_usd":     float(tx_total),
+        "admin_email":     admin["email"],
+    }
 
 
 # == SEARCH MODELS ===========================================================
