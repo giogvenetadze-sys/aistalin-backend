@@ -2,7 +2,7 @@
 # v2.0: JWT auth, HttpOnly session tokens, velocity check, daily limits
 # SYSTEM_INSTRUCTION, _generate(), RAG logic -- UNTOUCHED
 
-import os, asyncio, asyncpg, uuid, datetime, secrets, hashlib, hmac
+import os, asyncio, asyncpg, uuid, datetime, secrets, hashlib, hmac, time
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 import urllib.request, urllib.error, json as _json
@@ -36,6 +36,11 @@ PADDLE_ENV            = os.getenv("PADDLE_ENV", "sandbox")       # "sandbox" | "
 # ── Admin access ─────────────────────────────────────────────────────────────
 # Only this email can access future admin endpoints (e.g. /admin/*)
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "")  # Set in Railway Variables
+
+# In-memory store for short-lived admin dashboard tokens
+# { token_str: { "email": str, "expires": float } }
+# Tokens expire in 60 seconds — single use for redirect only
+_admin_dash_tokens: dict = {}
 JWT_ALGORITHM   = "HS256"
 JWT_EXPIRE_DAYS = 30
 EMBED_MODEL      = "models/gemini-embedding-001"
@@ -1076,6 +1081,29 @@ async def refund_page():
 # == ADMIN ENDPOINTS ==========================================================
 # All endpoints require ADMIN_EMAIL via require_admin dependency.
 
+# ── One-time dashboard token ─────────────────────────────────────────────
+@app.post("/admin/token")
+async def get_admin_dash_token(admin: dict = Depends(require_admin)):
+    """
+    Called by the frontend gear icon click.
+    Returns a short-lived (60s) single-use token.
+    Frontend opens /admin/dashboard?token=XXX in a new tab.
+    This avoids needing to pass JWT in URL params.
+    """
+    # Clean expired tokens
+    now = time.time()
+    expired = [k for k, v in _admin_dash_tokens.items() if v["expires"] < now]
+    for k in expired:
+        del _admin_dash_tokens[k]
+
+    token = secrets.token_urlsafe(32)
+    _admin_dash_tokens[token] = {
+        "email":   admin["email"],
+        "expires": now + 60,   # valid for 60 seconds only
+    }
+    return {"token": token, "expires_in": 60}
+
+
 # ── Stats ─────────────────────────────────────────────────────────────────
 @app.get("/admin/stats")
 async def admin_stats(admin: dict = Depends(require_admin)):
@@ -1247,9 +1275,63 @@ async def toggle_user_premium(uid: int, req: PremiumToggle, admin: dict = Depend
 
 # ── Admin Dashboard HTML ───────────────────────────────────────────────────
 @app.get("/admin/dashboard", response_class=HTMLResponse)
-async def admin_dashboard(admin: dict = Depends(require_admin)):
-    """Full admin control panel — served as a self-contained HTML page."""
-    return _admin_dashboard_html(admin["email"])
+async def admin_dashboard(
+    request: Request,
+    admin: dict = Depends(_optional_admin),
+):
+    """
+    Full admin control panel.
+    Accepts either:
+      - Standard JWT in Authorization header (API calls)
+      - ?token=ONE_TIME_TOKEN query param (browser redirect from gear icon)
+    """
+    email = None
+
+    # Path 1: one-time token from query param (browser navigation)
+    qtoken = request.query_params.get("token", "")
+    if qtoken:
+        now = time.time()
+        tok_data = _admin_dash_tokens.pop(qtoken, None)
+        if tok_data and tok_data["expires"] > now:
+            email = tok_data["email"]
+        else:
+            return HTMLResponse(
+                "<html><body style='background:#0d0603;color:#f5e6c8;font-family:Georgia,serif;"
+                "display:flex;align-items:center;justify-content:center;height:100vh;margin:0;'>"
+                "<div style='text-align:center'>"
+                "<p style='font-size:1.5rem;color:#d4a017;'>⚠ ლინკი ვადაგასულია</p>"
+                "<p style='opacity:.6;margin-top:.5rem;'>გთხოვთ კვლავ დააჭიროთ ⚙ ღილაკს</p>"
+                "<a href='https://aistalin.io' style='color:#d4a017;margin-top:1rem;display:block;'>← aistalin.io</a>"
+                "</div></body></html>",
+                status_code=403
+            )
+
+    # Path 2: JWT in Authorization header (already validated by Depends)
+    if email is None and admin:
+        email = admin.get("email", "")
+
+    if not email or email.lower() != ADMIN_EMAIL.lower():
+        return HTMLResponse(
+            "<html><body style='background:#0d0603;color:#f5e6c8;font-family:Georgia,serif;"
+            "display:flex;align-items:center;justify-content:center;height:100vh;margin:0;'>"
+            "<div style='text-align:center'>"
+            "<p style='font-size:1.5rem;color:#cc1b1b;'>⛔ Access Denied</p>"
+            "<p style='opacity:.6;margin-top:.5rem;'>Admin access only</p>"
+            "</div></body></html>",
+            status_code=403
+        )
+
+    return _admin_dashboard_html(email)
+
+
+async def _optional_admin(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))
+) -> dict:
+    """Like get_current_user but returns empty dict instead of raising 401."""
+    if not credentials:
+        return {}
+    result = decode_jwt(credentials.credentials)
+    return result or {}
 
 
 def _admin_dashboard_html(admin_email: str) -> str:
