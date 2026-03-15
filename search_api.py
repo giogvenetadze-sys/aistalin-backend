@@ -188,7 +188,12 @@ async def _create_tables():
         """CREATE INDEX IF NOT EXISTS idx_dq_active ON daily_quotes(is_active)""",
     ]
 
-    # Seed default settings if missing
+    # Create all tables FIRST
+    async with db_pool.acquire() as conn:
+        for s in stmts:
+            await conn.execute(s)
+
+    # THEN seed default settings (table now exists)
     async with db_pool.acquire() as conn:
         defaults = [
             ("ambient_volume",   "13"),
@@ -203,9 +208,6 @@ async def _create_tables():
                 "INSERT INTO site_settings (key, value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING",
                 k, v
             )
-    async with db_pool.acquire() as conn:
-        for s in stmts:
-            await conn.execute(s)
     print("OK All tables ready")
 
 
