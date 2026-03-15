@@ -6,3 +6,4 @@ python-dotenv
 passlib[bcrypt]
 python-jose[cryptography]
 email-validator
+google-auth>=2.28.0
