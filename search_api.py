@@ -2,7 +2,7 @@
 # v2.0: JWT auth, HttpOnly session tokens, velocity check, daily limits
 # SYSTEM_INSTRUCTION, _generate(), RAG logic -- UNTOUCHED
 
-import os, asyncio, asyncpg, uuid, datetime, secrets
+import os, asyncio, asyncpg, uuid, datetime, secrets, hashlib, hmac
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 import urllib.request, urllib.error, json as _json
@@ -26,6 +26,12 @@ DATABASE_URL    = os.getenv("DATABASE_URL")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
 JWT_SECRET      = os.getenv("JWT_SECRET", "change-this-in-production")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")  # Get from Google Cloud Console → APIs & Services → Credentials
+
+# ── Paddle configuration ─────────────────────────────────────────────────────
+# Paddle dashboard → Developer Tools → Notifications → Notification settings
+PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "")  # Notification secret key
+PADDLE_PRICE_ID       = os.getenv("PADDLE_PRICE_ID", "")        # pri_xxxx — your $5/mo price
+PADDLE_ENV            = os.getenv("PADDLE_ENV", "sandbox")       # "sandbox" | "production"
 JWT_ALGORITHM   = "HS256"
 JWT_EXPIRE_DAYS = 30
 EMBED_MODEL      = "models/gemini-embedding-001"
@@ -144,6 +150,19 @@ async def _create_tables():
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""",
         """CREATE INDEX IF NOT EXISTS idx_notes_user ON user_notes(user_id, created_at DESC)""",
+
+        # Paddle payment transactions log
+        """CREATE TABLE IF NOT EXISTS paddle_transactions (
+            id              SERIAL PRIMARY KEY,
+            paddle_event_id TEXT NOT NULL UNIQUE,
+            user_id         INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            email           TEXT,
+            amount_usd      NUMERIC(10,2),
+            status          TEXT,
+            raw_payload     TEXT,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_paddle_user ON paddle_transactions(user_id)""",
     ]
     async with db_pool.acquire() as conn:
         for s in stmts:
@@ -498,6 +517,211 @@ async def reset_password(req: ResetPasswordRequest):
 
     print(f"✅ Password reset for user_id={row['user_id']}")
     return {"status": "ok", "message": "Password updated successfully"}
+
+
+
+
+@app.get("/me")
+async def get_me(user: dict = Depends(get_current_user)):
+    """Returns current user info + fresh JWT if premium status changed."""
+    if not user:
+        raise HTTPException(401, "Not authenticated")
+    uid = int(user["sub"])
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, email, role, is_premium, premium_until FROM users WHERE id=$1", uid
+        )
+    if not row:
+        raise HTTPException(404, "User not found")
+    is_premium = row["is_premium"]
+    if is_premium and row["premium_until"]:
+        pu = row["premium_until"]
+        if pu.tzinfo is None:
+            pu = pu.replace(tzinfo=datetime.timezone.utc)
+        if pu < datetime.datetime.now(datetime.timezone.utc):
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET is_premium=FALSE WHERE id=$1", uid)
+            is_premium = False
+    result = {"id": row["id"], "email": row["email"],
+              "role": row["role"], "is_premium": is_premium}
+    # Fresh JWT if premium changed (frontend uses this to unlock chat)
+    if is_premium != user.get("is_premium", False):
+        result["new_token"] = create_jwt(row["id"], row["email"], row["role"], is_premium)
+    return result
+
+# == PADDLE PAYMENT ENDPOINTS ==============================================
+# Paddle Billing (v2 API) uses HMAC-SHA256 for webhook verification.
+# Docs: https://developer.paddle.com/webhooks/signature-verification
+
+def _verify_paddle_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
+    """
+    Verify Paddle webhook using HMAC-SHA256.
+    Header format: ts=TIMESTAMP;h1=SIGNATURE
+    """
+    if not secret:
+        # No secret configured — reject all webhooks (secure default)
+        return False
+    try:
+        parts = dict(p.split("=", 1) for p in signature_header.split(";"))
+        timestamp = parts.get("ts", "")
+        signature = parts.get("h1", "")
+        if not timestamp or not signature:
+            return False
+        # Paddle signed payload = "ts:raw_body"
+        signed_payload = f"{timestamp}:{raw_body.decode('utf-8')}".encode()
+        expected = hmac.new(
+            secret.encode("utf-8"),
+            signed_payload,
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, signature)
+    except Exception as e:
+        print(f"⚠ Paddle sig verification error: {e}")
+        return False
+
+
+class PaddleCheckoutSession(BaseModel):
+    """Frontend calls this to get customer data to pre-fill Paddle checkout."""
+    pass  # all data comes from JWT
+
+
+@app.get("/paddle/config")
+async def get_paddle_config(user: dict = Depends(get_current_user)):
+    """
+    Returns Paddle config + user data for the frontend checkout.
+    Frontend uses this to initialise Paddle.js with the correct price
+    and pre-filled customer info.
+    """
+    if not PADDLE_PRICE_ID:
+        raise HTTPException(500, "Paddle not configured (PADDLE_PRICE_ID missing)")
+
+    uid   = int(user["sub"]) if user else None
+    email = user.get("email", "") if user else ""
+
+    return {
+        "price_id":   PADDLE_PRICE_ID,
+        "environment": PADDLE_ENV,        # "sandbox" | "production"
+        "customer": {
+            "email": email,
+        },
+        "custom_data": {
+            "user_id": str(uid) if uid else "",
+            "email":   email,
+        },
+    }
+
+
+@app.post("/paddle-webhook", status_code=200)
+async def paddle_webhook(request: Request):
+    """
+    Receives Paddle webhook notifications.
+    Verifies signature, then updates the user's premium status.
+
+    Paddle event types we care about:
+      transaction.completed  → payment succeeded, grant premium
+      subscription.activated → subscription started
+      subscription.cancelled → subscription cancelled (optional: downgrade)
+    """
+    raw_body = await request.body()
+    sig_header = request.headers.get("Paddle-Signature", "")
+
+    # ── Security: verify signature ────────────────────────────────────────
+    if not _verify_paddle_signature(raw_body, sig_header, PADDLE_WEBHOOK_SECRET):
+        print(f"⚠ Paddle webhook: invalid signature | sig={sig_header[:40]}")
+        raise HTTPException(400, "Invalid webhook signature")
+
+    try:
+        payload = _json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(400, "Invalid JSON payload")
+
+    event_type = payload.get("event_type", "")
+    event_id   = payload.get("notification_id") or payload.get("event_id", str(uuid.uuid4()))
+
+    print(f"📦 Paddle event: {event_type} | id: {event_id}")
+
+    # ── Only process successful payment events ─────────────────────────────
+    if event_type not in ("transaction.completed", "subscription.activated", "subscription.updated"):
+        # Return 200 so Paddle doesn't retry non-payment events
+        return {"status": "ignored", "event_type": event_type}
+
+    # ── Extract user identification from custom_data ───────────────────────
+    # We pass custom_data.user_id and custom_data.email in the checkout
+    data        = payload.get("data", {})
+    custom_data = data.get("custom_data") or {}
+    email       = (custom_data.get("email") or
+                   data.get("customer", {}).get("email", "")).lower()
+    user_id_str = custom_data.get("user_id", "")
+
+    # ── Extract billing details ────────────────────────────────────────────
+    # Paddle v2 transaction amounts
+    details   = data.get("details", {})
+    totals    = details.get("totals", {})
+    amount    = totals.get("grand_total", 0)
+    currency  = data.get("currency_code", "USD")
+    status    = data.get("status", event_type)
+
+    # Convert cents to dollars (Paddle uses lowest currency unit)
+    try:
+        amount_usd = float(amount) / 100
+    except (TypeError, ValueError):
+        amount_usd = 0.0
+
+    # ── Deduplicate — same event_id should only be processed once ──────────
+    async with db_pool.acquire() as conn:
+        existing = await conn.fetchval(
+            "SELECT id FROM paddle_transactions WHERE paddle_event_id=$1", event_id
+        )
+        if existing:
+            print(f"ℹ️ Duplicate Paddle event {event_id} — skipping")
+            return {"status": "already_processed"}
+
+    # ── Find user in DB ────────────────────────────────────────────────────
+    user_row = None
+    async with db_pool.acquire() as conn:
+        # Try by user_id first (most reliable), then fall back to email
+        if user_id_str and user_id_str.isdigit():
+            user_row = await conn.fetchrow(
+                "SELECT id, email FROM users WHERE id=$1", int(user_id_str)
+            )
+        if not user_row and email:
+            user_row = await conn.fetchrow(
+                "SELECT id, email FROM users WHERE email=$1", email
+            )
+
+    if not user_row:
+        # Log the transaction even if we can't find the user
+        print(f"⚠ Paddle webhook: user not found | email={email} user_id={user_id_str}")
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO paddle_transactions "
+                "(paddle_event_id, user_id, email, amount_usd, status, raw_payload) "
+                "VALUES ($1, NULL, $2, $3, $4, $5)",
+                event_id, email, amount_usd, "user_not_found", raw_body.decode()[:5000]
+            )
+        return {"status": "user_not_found"}
+
+    # ── Grant premium — 30 days from now ─────────────────────────────────
+    premium_until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET is_premium=TRUE, premium_until=$1 WHERE id=$2",
+            premium_until, user_row["id"]
+        )
+        # Log successful transaction
+        await conn.execute(
+            "INSERT INTO paddle_transactions "
+            "(paddle_event_id, user_id, email, amount_usd, status, raw_payload) "
+            "VALUES ($1, $2, $3, $4, $5, $6)",
+            event_id, user_row["id"], user_row["email"],
+            amount_usd, "premium_granted", raw_body.decode()[:5000]
+        )
+
+    print(f"✅ Premium granted | user_id={user_row['id']} email={user_row['email']} "
+          f"amount=${amount_usd:.2f} until={premium_until.date()}")
+
+    return {"status": "ok", "premium_granted": True}
 
 
 # == BOOKMARKS ENDPOINTS ====================================================
