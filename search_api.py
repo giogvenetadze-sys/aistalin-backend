@@ -167,7 +167,42 @@ async def _create_tables():
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""",
         """CREATE INDEX IF NOT EXISTS idx_paddle_user ON paddle_transactions(user_id)""",
+
+        # Site settings — key/value store for admin-configurable options
+        """CREATE TABLE IF NOT EXISTS site_settings (
+            key        TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+
+        # Daily quotes — managed via admin dashboard, shown on the homepage
+        """CREATE TABLE IF NOT EXISTS daily_quotes (
+            id         SERIAL PRIMARY KEY,
+            text_ka    TEXT NOT NULL,
+            text_en    TEXT,
+            text_ru    TEXT,
+            source     TEXT,
+            is_active  BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""",
+        """CREATE INDEX IF NOT EXISTS idx_dq_active ON daily_quotes(is_active)""",
     ]
+
+    # Seed default settings if missing
+    async with db_pool.acquire() as conn:
+        defaults = [
+            ("ambient_volume",   "13"),
+            ("music_volume",     "13"),
+            ("chat_height_px",   "400"),
+            ("chat_width_pct",   "100"),
+            ("scroll_speed_px",  "38"),
+            ("ui_lang_default",  "ka"),
+        ]
+        for k, v in defaults:
+            await conn.execute(
+                "INSERT INTO site_settings (key, value) VALUES ($1,$2) ON CONFLICT (key) DO NOTHING",
+                k, v
+            )
     async with db_pool.acquire() as conn:
         for s in stmts:
             await conn.execute(s)
@@ -1036,28 +1071,665 @@ async def refund_page():
     return _legal_page("თანხის დაბრუნების პოლიტიკა", body)
 
 
-# == ADMIN ENDPOINTS (future) ================================================
-# Scaffold only — expand as needed.
-# All endpoints here require ADMIN_EMAIL via require_admin dependency.
+# == ADMIN ENDPOINTS ==========================================================
+# All endpoints require ADMIN_EMAIL via require_admin dependency.
 
+# ── Stats ─────────────────────────────────────────────────────────────────
 @app.get("/admin/stats")
 async def admin_stats(admin: dict = Depends(require_admin)):
-    """Basic platform statistics — admin only."""
     async with db_pool.acquire() as conn:
         user_count    = await conn.fetchval("SELECT COUNT(*) FROM users")
         premium_count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_premium=TRUE")
         chat_today    = await conn.fetchval(
             "SELECT COUNT(*) FROM chat_history WHERE created_at::date = CURRENT_DATE"
         )
+        users_today   = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE created_at::date = CURRENT_DATE"
+        )
         tx_total      = await conn.fetchval(
             "SELECT COALESCE(SUM(amount_usd),0) FROM paddle_transactions WHERE status='premium_granted'"
         )
+        tx_month      = await conn.fetchval(
+            """SELECT COALESCE(SUM(amount_usd),0) FROM paddle_transactions
+               WHERE status='premium_granted'
+               AND created_at >= date_trunc('month', CURRENT_DATE)"""
+        )
     return {
-        "users_total":     user_count,
-        "users_premium":   premium_count,
-        "chats_today":     chat_today,
-        "revenue_usd":     float(tx_total),
-        "admin_email":     admin["email"],
+        "users_total":   user_count,
+        "users_premium": premium_count,
+        "users_today":   users_today,
+        "chats_today":   chat_today,
+        "revenue_total": float(tx_total),
+        "revenue_month": float(tx_month),
+        "admin_email":   admin["email"],
+    }
+
+
+# ── Site Settings CRUD ─────────────────────────────────────────────────────
+@app.get("/admin/settings")
+async def get_settings(admin: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT key, value FROM site_settings ORDER BY key")
+    return {r["key"]: r["value"] for r in rows}
+
+class SettingUpdate(BaseModel):
+    key:   str
+    value: str
+
+@app.post("/admin/settings")
+async def update_setting(req: SettingUpdate, admin: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO site_settings (key, value, updated_at) VALUES ($1,$2,NOW())
+               ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()""",
+            req.key, req.value
+        )
+    return {"status": "ok", "key": req.key, "value": req.value}
+
+
+# ── Daily Quotes CRUD ──────────────────────────────────────────────────────
+@app.get("/admin/quotes")
+async def list_quotes(admin: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id,text_ka,text_en,text_ru,source,is_active,created_at FROM daily_quotes ORDER BY id DESC"
+        )
+    return [{"id":r["id"],"text_ka":r["text_ka"],"text_en":r["text_en"],
+             "text_ru":r["text_ru"],"source":r["source"],"is_active":r["is_active"]} for r in rows]
+
+class QuoteCreate(BaseModel):
+    text_ka:   str
+    text_en:   Optional[str] = None
+    text_ru:   Optional[str] = None
+    source:    Optional[str] = None
+    is_active: bool = True
+
+@app.post("/admin/quotes", status_code=201)
+async def create_quote(req: QuoteCreate, admin: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO daily_quotes (text_ka,text_en,text_ru,source,is_active)
+               VALUES ($1,$2,$3,$4,$5) RETURNING id""",
+            req.text_ka, req.text_en, req.text_ru, req.source, req.is_active
+        )
+    return {"status":"created","id":row["id"]}
+
+@app.put("/admin/quotes/{qid}")
+async def update_quote(qid: int, req: QuoteCreate, admin: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        r = await conn.execute(
+            """UPDATE daily_quotes SET text_ka=$1,text_en=$2,text_ru=$3,
+               source=$4,is_active=$5 WHERE id=$6""",
+            req.text_ka,req.text_en,req.text_ru,req.source,req.is_active,qid
+        )
+    if r=="UPDATE 0": raise HTTPException(404,"Quote not found")
+    return {"status":"updated"}
+
+@app.delete("/admin/quotes/{qid}")
+async def delete_quote(qid: int, admin: dict = Depends(require_admin)):
+    async with db_pool.acquire() as conn:
+        r = await conn.execute("DELETE FROM daily_quotes WHERE id=$1", qid)
+    if r=="DELETE 0": raise HTTPException(404,"Quote not found")
+    return {"status":"deleted"}
+
+# Public endpoint — homepage uses this to get today's quote (from DB if available)
+@app.get("/quotes/today")
+async def get_today_quote():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT text_ka,text_en,text_ru,source FROM daily_quotes WHERE is_active=TRUE ORDER BY id"
+        )
+    if not rows:
+        return {"quote": None}
+    # Rotate by day-of-year
+    import time
+    idx = int(time.time() // 86400) % len(rows)
+    r = rows[idx]
+    return {"text_ka":r["text_ka"],"text_en":r["text_en"],"text_ru":r["text_ru"],"source":r["source"]}
+
+
+# ── User Management ────────────────────────────────────────────────────────
+@app.get("/admin/users")
+async def list_users(
+    search: str = "", page: int = 1, per_page: int = 30,
+    admin: dict = Depends(require_admin)
+):
+    offset = (page - 1) * per_page
+    async with db_pool.acquire() as conn:
+        if search:
+            rows = await conn.fetch(
+                """SELECT id,email,role,is_premium,premium_until,created_at,ip_address
+                   FROM users WHERE email ILIKE $1 ORDER BY id DESC LIMIT $2 OFFSET $3""",
+                f"%{search}%", per_page, offset
+            )
+            total = await conn.fetchval("SELECT COUNT(*) FROM users WHERE email ILIKE $1", f"%{search}%")
+        else:
+            rows = await conn.fetch(
+                """SELECT id,email,role,is_premium,premium_until,created_at,ip_address
+                   FROM users ORDER BY id DESC LIMIT $1 OFFSET $2""",
+                per_page, offset
+            )
+            total = await conn.fetchval("SELECT COUNT(*) FROM users")
+    return {
+        "total": total, "page": page, "per_page": per_page,
+        "users": [{
+            "id":          r["id"],
+            "email":       r["email"],
+            "role":        r["role"],
+            "is_premium":  r["is_premium"],
+            "premium_until": r["premium_until"].isoformat() if r["premium_until"] else None,
+            "created_at":  r["created_at"].strftime("%Y-%m-%d"),
+            "ip":          r["ip_address"],
+        } for r in rows]
+    }
+
+class PremiumToggle(BaseModel):
+    is_premium: bool
+    days:       int = 30  # how many days to grant (if enabling)
+
+@app.post("/admin/users/{uid}/premium")
+async def toggle_user_premium(uid: int, req: PremiumToggle, admin: dict = Depends(require_admin)):
+    if req.is_premium:
+        until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=req.days)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET is_premium=TRUE, premium_until=$1 WHERE id=$2", until, uid
+            )
+    else:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET is_premium=FALSE, premium_until=NULL WHERE id=$1", uid
+            )
+    return {"status":"ok","user_id":uid,"is_premium":req.is_premium}
+
+
+# ── Admin Dashboard HTML ───────────────────────────────────────────────────
+@app.get("/admin/dashboard", response_class=HTMLResponse)
+async def admin_dashboard(admin: dict = Depends(require_admin)):
+    """Full admin control panel — served as a self-contained HTML page."""
+    return _admin_dashboard_html(admin["email"])
+
+
+def _admin_dashboard_html(admin_email: str) -> str:
+    api = "https://aistalin-backend-production.up.railway.app"
+    return f"""<!doctype html><html lang="ka"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin — AiStalin.io</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+<style>
+:root{{--bg:#0d0603;--bg2:#140804;--bg3:#1a0c04;--border:rgba(92,45,15,.5);
+  --gold:#d4a017;--gold2:rgba(212,160,23,.65);--cream:#f5e6c8;--cream2:rgba(212,184,150,.7);
+  --red:#cc1b1b;--green:#4caf50;--r:8px}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:var(--bg);color:var(--cream2);font-family:'Inter',sans-serif;font-size:14px;min-height:100vh}}
+/* Layout */
+.shell{{display:flex;min-height:100vh}}
+.sidebar{{width:220px;flex-shrink:0;background:var(--bg2);border-right:1px solid var(--border);
+  padding:1.5rem 0;display:flex;flex-direction:column;position:sticky;top:0;height:100vh}}
+.main{{flex:1;padding:2rem;overflow-x:hidden;max-width:100%}}
+@media(max-width:768px){{
+  .shell{{flex-direction:column}}
+  .sidebar{{width:100%;height:auto;flex-direction:row;flex-wrap:wrap;padding:.75rem;
+    position:relative;gap:.25rem}}
+  .main{{padding:1rem}}
+  .sidebar .logo{{width:100%;margin-bottom:.5rem}}
+  .sidebar a{{padding:.4rem .75rem;font-size:.8rem}}
+  .grid-4,.grid-3{{grid-template-columns:repeat(2,1fr)}}
+  .grid-2{{grid-template-columns:1fr}}
+  table{{font-size:.8rem}}
+  .hide-mobile{{display:none}}
+}}
+@media(max-width:480px){{
+  .grid-4,.grid-3,.grid-2{{grid-template-columns:1fr}}
+  .main{{padding:.75rem}}
+}}
+/* Sidebar */
+.logo{{padding:0 1.25rem 1.25rem;border-bottom:1px solid var(--border);margin-bottom:.75rem}}
+.logo h1{{font-family:'Playfair Display',serif;font-size:1.1rem;color:var(--gold);letter-spacing:.08em}}
+.logo p{{font-size:.68rem;color:rgba(212,184,150,.4);margin-top:.2rem}}
+.nav-item{{display:flex;align-items:center;gap:.6rem;padding:.6rem 1.25rem;
+  color:var(--cream2);text-decoration:none;transition:all .18s;cursor:pointer;
+  border:none;background:none;width:100%;font-size:.85rem;font-family:'Inter',sans-serif}}
+.nav-item:hover,.nav-item.active{{background:rgba(212,160,23,.08);color:var(--gold);
+  border-left:2px solid var(--gold)}}
+.nav-item i{{width:16px;opacity:.7}}
+.sidebar-foot{{margin-top:auto;padding:1rem 1.25rem;border-top:1px solid var(--border);
+  font-size:.72rem;color:rgba(212,184,150,.35)}}
+/* Sections */
+.section{{display:none}}.section.active{{display:block}}
+.section-title{{font-family:'Playfair Display',serif;font-size:1.3rem;color:var(--gold);
+  margin-bottom:1.5rem;padding-bottom:.6rem;border-bottom:1px solid var(--border)}}
+/* Cards */
+.card{{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
+  padding:1.25rem;margin-bottom:1rem}}
+.card-title{{font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;
+  color:rgba(212,184,150,.5);margin-bottom:.75rem}}
+/* Stat cards */
+.grid-4{{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:1.5rem}}
+.grid-3{{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}}
+.grid-2{{display:grid;grid-template-columns:repeat(2,1fr);gap:1rem}}
+.stat-card{{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
+  padding:1.25rem;text-align:center}}
+.stat-num{{font-family:'Playfair Display',serif;font-size:2rem;color:var(--gold);line-height:1}}
+.stat-lbl{{font-size:.72rem;color:rgba(212,184,150,.5);margin-top:.35rem;letter-spacing:.05em}}
+/* Form elements */
+label{{display:block;font-size:.75rem;color:var(--cream2);margin-bottom:.4rem;opacity:.8}}
+input[type=text],input[type=number],textarea,select{{
+  width:100%;background:rgba(15,5,2,.7);border:1px solid var(--border);
+  border-radius:5px;padding:.55rem .75rem;color:var(--cream);font-family:'Inter',sans-serif;
+  font-size:.88rem;outline:none;transition:border-color .2s}}
+input[type=text]:focus,input[type=number]:focus,textarea:focus{{border-color:var(--gold)}}
+textarea{{resize:vertical;min-height:80px}}
+input[type=range]{{width:100%;accent-color:var(--gold);cursor:pointer;height:4px}}
+/* Buttons */
+.btn{{display:inline-flex;align-items:center;gap:.4rem;padding:.55rem 1.1rem;
+  border-radius:5px;border:none;cursor:pointer;font-size:.82rem;font-family:'Inter',sans-serif;
+  font-weight:500;transition:all .18s;white-space:nowrap}}
+.btn-gold{{background:linear-gradient(135deg,#d4a017,#a07810);color:#1a0c04}}
+.btn-gold:hover{{background:linear-gradient(135deg,#e8b520,#b88c14);transform:translateY(-1px)}}
+.btn-red{{background:linear-gradient(135deg,#cc1b1b,#8b0000);color:#fff}}
+.btn-red:hover{{opacity:.88}}
+.btn-ghost{{background:none;border:1px solid var(--border);color:var(--cream2)}}
+.btn-ghost:hover{{border-color:var(--gold);color:var(--gold)}}
+.btn-sm{{padding:.35rem .75rem;font-size:.75rem}}
+.btn-green{{background:linear-gradient(135deg,#2e7d32,#1b5e20);color:#fff}}
+/* Table */
+.tbl-wrap{{overflow-x:auto;border-radius:var(--r);border:1px solid var(--border)}}
+table{{width:100%;border-collapse:collapse}}
+th{{padding:.65rem .85rem;text-align:left;font-size:.72rem;text-transform:uppercase;
+  letter-spacing:.06em;color:rgba(212,184,150,.5);background:rgba(26,12,4,.6);
+  border-bottom:1px solid var(--border);white-space:nowrap}}
+td{{padding:.65rem .85rem;border-bottom:1px solid rgba(92,45,15,.25);font-size:.85rem;
+  vertical-align:middle}}
+tr:last-child td{{border-bottom:none}}
+tr:hover td{{background:rgba(212,160,23,.04)}}
+/* Badges */
+.badge{{display:inline-block;padding:.2rem .55rem;border-radius:12px;
+  font-size:.68rem;font-weight:600;letter-spacing:.04em}}
+.badge-gold{{background:rgba(212,160,23,.15);color:var(--gold);border:1px solid rgba(212,160,23,.3)}}
+.badge-gray{{background:rgba(92,45,15,.25);color:rgba(212,184,150,.5);border:1px solid var(--border)}}
+.badge-green{{background:rgba(76,175,80,.15);color:#66bb6a;border:1px solid rgba(76,175,80,.3)}}
+/* Misc */
+.search-row{{display:flex;gap:.75rem;margin-bottom:1rem;align-items:center;flex-wrap:wrap}}
+.search-row input{{flex:1;min-width:180px}}
+.msg{{padding:.65rem 1rem;border-radius:5px;font-size:.82rem;margin-bottom:.75rem;display:none}}
+.msg-ok{{background:rgba(76,175,80,.12);border:1px solid rgba(76,175,80,.3);color:#81c784}}
+.msg-err{{background:rgba(204,27,27,.12);border:1px solid rgba(204,27,27,.3);color:#ef9a9a}}
+.sep{{height:1px;background:var(--border);margin:1.25rem 0}}
+.range-row{{display:flex;align-items:center;gap:.75rem}}
+.range-row span{{min-width:3rem;text-align:right;color:var(--gold);font-size:.82rem}}
+.pill-toggle{{display:inline-flex;border-radius:20px;overflow:hidden;border:1px solid var(--border)}}
+.pill-toggle button{{padding:.3rem .8rem;border:none;background:none;cursor:pointer;
+  font-size:.75rem;color:var(--cream2);transition:all .15s}}
+.pill-toggle button.on{{background:var(--gold);color:#1a0c04;font-weight:600}}
+</style>
+</head>
+<body>
+<div class="shell">
+
+<!-- ── Sidebar ── -->
+<aside class="sidebar">
+  <div class="logo">
+    <h1>⚙ AiStalin Admin</h1>
+    <p>{admin_email}</p>
+  </div>
+  <button class="nav-item active" onclick="show('dash',this)"><i class="fa fa-chart-bar"></i>Dashboard</button>
+  <button class="nav-item" onclick="show('users',this)"><i class="fa fa-users"></i>მომხმარებლები</button>
+  <button class="nav-item" onclick="show('quotes',this)"><i class="fa fa-quote-left"></i>Daily Quotes</button>
+  <button class="nav-item" onclick="show('settings',this)"><i class="fa fa-sliders"></i>პარამეტრები</button>
+  <div class="sidebar-foot">
+    <a href="https://aistalin.io" style="color:inherit;text-decoration:none;">← aistalin.io</a>
+  </div>
+</aside>
+
+<!-- ── Main ── -->
+<main class="main">
+
+<!-- DASHBOARD -->
+<div id="sec-dash" class="section active">
+  <div class="section-title">Dashboard</div>
+  <div class="grid-4" id="stats-grid">
+    <div class="stat-card"><div class="stat-num" id="s-users">—</div><div class="stat-lbl">სულ მომხმარებელი</div></div>
+    <div class="stat-card"><div class="stat-num" id="s-premium">—</div><div class="stat-lbl">Premium</div></div>
+    <div class="stat-card"><div class="stat-num" id="s-chats">—</div><div class="stat-lbl">ჩათი დღეს</div></div>
+    <div class="stat-card"><div class="stat-num" id="s-rev">—</div><div class="stat-lbl">შემოსავალი ($)</div></div>
+  </div>
+  <div class="grid-2">
+    <div class="card">
+      <div class="card-title">ახალი მომხმარებლები დღეს</div>
+      <div id="s-today" style="font-size:2.5rem;font-family:'Playfair Display',serif;color:var(--gold)">—</div>
+    </div>
+    <div class="card">
+      <div class="card-title">შემოსავალი ამ თვეში</div>
+      <div id="s-month" style="font-size:2.5rem;font-family:'Playfair Display',serif;color:var(--gold)">—</div>
+    </div>
+  </div>
+</div>
+
+<!-- USERS -->
+<div id="sec-users" class="section">
+  <div class="section-title">მომხმარებლები</div>
+  <div class="search-row">
+    <input id="u-search" type="text" placeholder="ელ-ფოსტით ძიება..." oninput="debounceUserSearch()">
+    <button class="btn btn-ghost" onclick="loadUsers()"><i class="fa fa-refresh"></i> განახლება</button>
+  </div>
+  <div id="u-msg" class="msg"></div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr>
+        <th>ID</th><th>ელ-ფოსტა</th>
+        <th class="hide-mobile">რეგისტრაცია</th>
+        <th class="hide-mobile">IP</th>
+        <th>სტატუსი</th><th>მოქმედება</th>
+      </tr></thead>
+      <tbody id="u-tbody"><tr><td colspan="6" style="text-align:center;padding:2rem;opacity:.4">იტვირთება...</td></tr></tbody>
+    </table>
+  </div>
+  <div id="u-pagination" style="margin-top:.75rem;display:flex;gap:.5rem;flex-wrap:wrap"></div>
+</div>
+
+<!-- QUOTES -->
+<div id="sec-quotes" class="section">
+  <div class="section-title">Daily Stalin Quotes</div>
+  <div id="q-msg" class="msg"></div>
+  <div class="card">
+    <div class="card-title">ახალი ციტატის დამატება</div>
+    <div style="margin-bottom:.75rem">
+      <label>ტექსტი (ქართული) *</label>
+      <textarea id="q-ka" placeholder="ქართული ტექსტი..."></textarea>
+    </div>
+    <div class="grid-2" style="margin-bottom:.75rem">
+      <div><label>ტექსტი (English)</label>
+      <textarea id="q-en" placeholder="English text..." style="min-height:60px"></textarea></div>
+      <div><label>ტექსტი (Русский)</label>
+      <textarea id="q-ru" placeholder="Русский текст..." style="min-height:60px"></textarea></div>
+    </div>
+    <div style="margin-bottom:1rem">
+      <label>წყარო (მაგ: ტომი 11)</label>
+      <input id="q-src" type="text" placeholder="ტომი X">
+    </div>
+    <button class="btn btn-gold" onclick="addQuote()"><i class="fa fa-plus"></i> დამატება</button>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>ID</th><th>ტექსტი (KA)</th><th class="hide-mobile">წყარო</th><th>სტატუსი</th><th>მოქმედება</th></tr></thead>
+      <tbody id="q-tbody"><tr><td colspan="5" style="text-align:center;padding:2rem;opacity:.4">იტვირთება...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- SETTINGS -->
+<div id="sec-settings" class="section">
+  <div class="section-title">პარამეტრები</div>
+  <div id="st-msg" class="msg"></div>
+  <div class="grid-2">
+    <!-- Audio -->
+    <div class="card">
+      <div class="card-title">🎵 Audio</div>
+      <div style="margin-bottom:1rem">
+        <label>Ambient Volume (default)</label>
+        <div class="range-row">
+          <input type="range" min="0" max="100" id="s-amb" oninput="document.getElementById('s-amb-v').textContent=this.value+'%'">
+          <span id="s-amb-v">13%</span>
+        </div>
+      </div>
+      <div>
+        <label>Background Music Volume</label>
+        <div class="range-row">
+          <input type="range" min="0" max="100" id="s-mus" oninput="document.getElementById('s-mus-v').textContent=this.value+'%'">
+          <span id="s-mus-v">13%</span>
+        </div>
+      </div>
+    </div>
+    <!-- Chat UI -->
+    <div class="card">
+      <div class="card-title">💬 Chat UI</div>
+      <div style="margin-bottom:1rem">
+        <label>Chat Height (px)</label>
+        <div class="range-row">
+          <input type="range" min="200" max="800" step="20" id="s-ch" oninput="document.getElementById('s-ch-v').textContent=this.value+'px'">
+          <span id="s-ch-v">400px</span>
+        </div>
+      </div>
+      <div>
+        <label>Scroll Speed (px per wheel tick)</label>
+        <div class="range-row">
+          <input type="range" min="10" max="100" step="5" id="s-sc" oninput="document.getElementById('s-sc-v').textContent=this.value+'px'">
+          <span id="s-sc-v">38px</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-title">🌐 ენა / Multilingual</div>
+    <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
+      <label style="margin:0">Default UI Language:</label>
+      <select id="s-lang" style="width:auto">
+        <option value="ka">ქართული (KA)</option>
+        <option value="en">English (EN)</option>
+        <option value="ru">Русский (RU)</option>
+      </select>
+      <span style="font-size:.75rem;opacity:.5">Russian RAG: not yet loaded</span>
+    </div>
+  </div>
+  <button class="btn btn-gold" onclick="saveSettings()"><i class="fa fa-save"></i> შენახვა</button>
+</div>
+
+</main></div>
+
+<script>
+const API='{api}';
+const HEADERS={{'Content-Type':'application/json','Authorization':'Bearer '+localStorage.getItem('aistalin_jwt')}};
+
+// ── Nav ──────────────────────────────────────────────────────────
+function show(sec,btn){{
+  document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(b=>b.classList.remove('active'));
+  document.getElementById('sec-'+sec).classList.add('active');
+  btn.classList.add('active');
+  if(sec==='dash')loadStats();
+  if(sec==='users')loadUsers();
+  if(sec==='quotes')loadQuotes();
+  if(sec==='settings')loadSettings();
+}}
+
+// ── Stats ─────────────────────────────────────────────────────────
+async function loadStats(){{
+  try{{
+    const r=await fetch(API+'/admin/stats',{{headers:HEADERS}});
+    const d=await r.json();
+    document.getElementById('s-users').textContent=d.users_total;
+    document.getElementById('s-premium').textContent=d.users_premium;
+    document.getElementById('s-chats').textContent=d.chats_today;
+    document.getElementById('s-rev').textContent='$'+parseFloat(d.revenue_total).toFixed(2);
+    document.getElementById('s-today').textContent=d.users_today;
+    document.getElementById('s-month').textContent='$'+parseFloat(d.revenue_month).toFixed(2);
+  }}catch(e){{console.error(e)}}
+}}
+
+// ── Users ─────────────────────────────────────────────────────────
+let _uPage=1,_uSearch='',_uTimer=null;
+function debounceUserSearch(){{
+  clearTimeout(_uTimer);
+  _uTimer=setTimeout(()=>{{_uPage=1;_uSearch=document.getElementById('u-search').value.trim();loadUsers();}},350);
+}}
+async function loadUsers(){{
+  const tbody=document.getElementById('u-tbody');
+  tbody.innerHTML='<tr><td colspan="6" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
+  try{{
+    const r=await fetch(API+`/admin/users?page=${{_uPage}}&search=${{encodeURIComponent(_uSearch)}}`,{{headers:HEADERS}});
+    const d=await r.json();
+    if(!d.users||!d.users.length){{tbody.innerHTML='<tr><td colspan="6" style="text-align:center;padding:1.5rem;opacity:.4">მომხმარებლები არ მოიძებნა</td></tr>';return;}}
+    tbody.innerHTML=d.users.map(u=>`
+      <tr>
+        <td style="opacity:.5">${{u.id}}</td>
+        <td style="font-family:'Playfair Display',serif">${{u.email}}</td>
+        <td class="hide-mobile" style="opacity:.5">${{u.created_at}}</td>
+        <td class="hide-mobile" style="opacity:.4;font-size:.75rem">${{u.ip||'—'}}</td>
+        <td>${{u.is_premium
+          ?'<span class="badge badge-gold">★ Premium</span>'
+          :'<span class="badge badge-gray">Free</span>'}}</td>
+        <td>
+          ${{u.is_premium
+            ?`<button class="btn btn-sm btn-red" onclick="togglePremium(${{u.id}},false)">Revoke</button>`
+            :`<button class="btn btn-sm btn-green" onclick="togglePremium(${{u.id}},true)">Grant</button>`}}
+        </td>
+      </tr>`).join('');
+    // Pagination
+    const pages=Math.ceil(d.total/d.per_page);
+    const pg=document.getElementById('u-pagination');
+    pg.innerHTML='';
+    for(let i=1;i<=Math.min(pages,10);i++){{
+      const b=document.createElement('button');
+      b.className='btn btn-ghost btn-sm'+(i===_uPage?' btn-gold':'');
+      b.textContent=i;b.onclick=(()=>{{const p=i;return()=>{{_uPage=p;loadUsers();}}}})();
+      pg.appendChild(b);
+    }}
+  }}catch(e){{tbody.innerHTML='<tr><td colspan="6" style="color:#ef9a9a;text-align:center;padding:1.5rem">შეცდომა: '+e.message+'</td></tr>';}}
+}}
+async function togglePremium(uid,grant){{
+  const el=document.getElementById('u-msg');
+  try{{
+    await fetch(API+'/admin/users/'+uid+'/premium',{{method:'POST',headers:HEADERS,body:JSON.stringify({{is_premium:grant,days:30}})}});
+    showMsg('u-msg','✓ '+(grant?'Premium მიენიჭა':'Premium გაუქმდა'),true);
+    loadUsers();
+  }}catch(e){{showMsg('u-msg','⚠ '+e.message,false);}}
+}}
+
+// ── Quotes ────────────────────────────────────────────────────────
+async function loadQuotes(){{
+  const tbody=document.getElementById('q-tbody');
+  tbody.innerHTML='<tr><td colspan="5" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
+  try{{
+    const r=await fetch(API+'/admin/quotes',{{headers:HEADERS}});
+    const quotes=await r.json();
+    if(!quotes.length){{tbody.innerHTML='<tr><td colspan="5" style="text-align:center;opacity:.4;padding:1.5rem">ციტატები არ არის</td></tr>';return;}}
+    tbody.innerHTML=quotes.map(q=>`
+      <tr>
+        <td style="opacity:.5">${{q.id}}</td>
+        <td style="font-family:'Playfair Display',serif;font-size:.82rem;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${{q.text_ka}}</td>
+        <td class="hide-mobile" style="opacity:.5">${{q.source||'—'}}</td>
+        <td>${{q.is_active?'<span class="badge badge-green">Active</span>':'<span class="badge badge-gray">Off</span>'}}</td>
+        <td style="display:flex;gap:.4rem;flex-wrap:wrap">
+          <button class="btn btn-sm btn-ghost" onclick="toggleQuote(${{q.id}},${{!q.is_active}},\`${{encodeURIComponent(q.text_ka)}}\`,\`${{encodeURIComponent(q.text_en||'')}}\`,\`${{encodeURIComponent(q.text_ru||'')}}\`,\`${{encodeURIComponent(q.source||'')}}\`)">${{q.is_active?'Off':'On'}}</button>
+          <button class="btn btn-sm btn-red" onclick="deleteQuote(${{q.id}})"><i class="fa fa-trash"></i></button>
+        </td>
+      </tr>`).join('');
+  }}catch(e){{tbody.innerHTML='<tr><td colspan="5" style="color:#ef9a9a;text-align:center;padding:1.5rem">შეცდომა</td></tr>';}}
+}}
+async function addQuote(){{
+  const ka=document.getElementById('q-ka').value.trim();
+  if(!ka){{showMsg('q-msg','⚠ ქართული ტექსტი სავალდებულოა',false);return;}}
+  try{{
+    await fetch(API+'/admin/quotes',{{method:'POST',headers:HEADERS,body:JSON.stringify({{
+      text_ka:ka,text_en:document.getElementById('q-en').value.trim()||null,
+      text_ru:document.getElementById('q-ru').value.trim()||null,
+      source:document.getElementById('q-src').value.trim()||null,is_active:true
+    }})}});
+    document.getElementById('q-ka').value='';document.getElementById('q-en').value='';
+    document.getElementById('q-ru').value='';document.getElementById('q-src').value='';
+    showMsg('q-msg','✓ ციტატა დაემატა',true);loadQuotes();
+  }}catch(e){{showMsg('q-msg','⚠ '+e.message,false);}}
+}}
+async function deleteQuote(id){{
+  if(!confirm('წაიშლება. გაგრძელება?'))return;
+  try{{await fetch(API+'/admin/quotes/'+id,{{method:'DELETE',headers:HEADERS}});showMsg('q-msg','✓ წაიშალა',true);loadQuotes();}}catch(e){{showMsg('q-msg','⚠ '+e.message,false);}}
+}}
+async function toggleQuote(id,active,ka,en,ru,src){{
+  try{{
+    await fetch(API+'/admin/quotes/'+id,{{method:'PUT',headers:HEADERS,body:JSON.stringify({{
+      text_ka:decodeURIComponent(ka),text_en:decodeURIComponent(en)||null,
+      text_ru:decodeURIComponent(ru)||null,source:decodeURIComponent(src)||null,is_active:active
+    }})}});
+    loadQuotes();
+  }}catch(e){{showMsg('q-msg','⚠ '+e.message,false);}}
+}}
+
+// ── Settings ──────────────────────────────────────────────────────
+async function loadSettings(){{
+  try{{
+    const r=await fetch(API+'/admin/settings',{{headers:HEADERS}});
+    const s=await r.json();
+    const set=(id,key,suffix='')=>{{
+      const el=document.getElementById(id);
+      if(el&&s[key]!==undefined){{el.value=s[key];const lbl=document.getElementById(id+'-v');if(lbl)lbl.textContent=s[key]+suffix;}}
+    }};
+    set('s-amb','ambient_volume','%');set('s-mus','music_volume','%');
+    set('s-ch','chat_height_px','px');set('s-sc','scroll_speed_px','px');
+    const lang=document.getElementById('s-lang');if(lang&&s.ui_lang_default)lang.value=s.ui_lang_default;
+  }}catch(e){{showMsg('st-msg','⚠ Settings load failed',false);}}
+}}
+async function saveSettings(){{
+  const pairs=[
+    ['ambient_volume',document.getElementById('s-amb').value],
+    ['music_volume',document.getElementById('s-mus').value],
+    ['chat_height_px',document.getElementById('s-ch').value],
+    ['scroll_speed_px',document.getElementById('s-sc').value],
+    ['ui_lang_default',document.getElementById('s-lang').value],
+  ];
+  try{{
+    await Promise.all(pairs.map(([k,v])=>fetch(API+'/admin/settings',{{method:'POST',headers:HEADERS,body:JSON.stringify({{key:k,value:v}})}})));
+    showMsg('st-msg','✓ შენახულია',true);
+  }}catch(e){{showMsg('st-msg','⚠ '+e.message,false);}}
+}}
+
+// ── Util ──────────────────────────────────────────────────────────
+function showMsg(id,text,ok){{
+  const el=document.getElementById(id);if(!el)return;
+  el.textContent=text;el.className='msg '+(ok?'msg-ok':'msg-err');el.style.display='block';
+  setTimeout(()=>{{el.style.display='none';}},4000);
+}}
+
+// ── Init ──────────────────────────────────────────────────────────
+loadStats();
+</script>
+</body></html>"""
+
+
+
+# == MULTILINGUAL INFRASTRUCTURE ============================================
+# Supported languages — add Russian RAG data when embeddings are ready.
+# Structure: language code → metadata.
+# To activate Russian: run embed_generator.py with ACTIVE_LANGS=["ru"]
+# then set the language column in aistalin_chunks.
+
+SUPPORTED_LANGUAGES = {
+    "ka": {
+        "name":        "ქართული",
+        "name_en":     "Georgian",
+        "rag_ready":   True,    # Embedded in pgvector ✓
+        "chunks_col":  "ka",
+    },
+    "en": {
+        "name":        "English",
+        "name_en":     "English",
+        "rag_ready":   True,    # Embedded ✓
+        "chunks_col":  "en",
+    },
+    "ru": {
+        "name":        "Русский",
+        "name_en":     "Russian",
+        "rag_ready":   False,   # Pending — run embed_generator.py with ru
+        "chunks_col":  "ru",
+    },
+    # Future: "de", "fr", "zh", "es"
+}
+
+@app.get("/languages")
+async def get_languages():
+    """Returns supported languages + RAG readiness status.
+    Frontend uses this to grey out unavailable language buttons.
+    """
+    return {
+        "languages": {
+            k: {
+                "name":      v["name"],
+                "name_en":   v["name_en"],
+                "rag_ready": v["rag_ready"],
+            }
+            for k, v in SUPPORTED_LANGUAGES.items()
+        }
     }
 
 
