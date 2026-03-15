@@ -1273,6 +1273,17 @@ async def toggle_user_premium(uid: int, req: PremiumToggle, admin: dict = Depend
     return {"status":"ok","user_id":uid,"is_premium":req.is_premium}
 
 
+# ── Optional admin auth (for browser navigation with ?token=) ─────────────
+async def _optional_admin(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))
+) -> dict:
+    """Like get_current_user but returns empty dict instead of raising 401."""
+    if not credentials:
+        return {}
+    result = decode_jwt(credentials.credentials)
+    return result or {}
+
+
 # ── Admin Dashboard HTML ───────────────────────────────────────────────────
 @app.get("/admin/dashboard", response_class=HTMLResponse)
 async def admin_dashboard(
@@ -1324,14 +1335,7 @@ async def admin_dashboard(
     return _admin_dashboard_html(email)
 
 
-async def _optional_admin(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))
-) -> dict:
-    """Like get_current_user but returns empty dict instead of raising 401."""
-    if not credentials:
-        return {}
-    result = decode_jwt(credentials.credentials)
-    return result or {}
+
 
 
 def _admin_dashboard_html(admin_email: str) -> str:
