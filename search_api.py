@@ -1161,6 +1161,19 @@ async def update_setting(req: SettingUpdate, admin: dict = Depends(require_admin
     return {"status": "ok", "key": req.key, "value": req.value}
 
 
+# ── Public settings (read-only, no auth) ──────────────────────────────────
+@app.get("/settings/public")
+async def get_public_settings():
+    """Read-only public endpoint for site settings.
+    Frontend uses this to apply admin-configured audio volumes, chat height, etc.
+    No authentication required — these are display preferences only.
+    Response is cached-friendly (settings change rarely).
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT key, value FROM site_settings ORDER BY key")
+    return {r["key"]: r["value"] for r in rows}
+
+
 # ── Daily Quotes CRUD ──────────────────────────────────────────────────────
 @app.get("/admin/quotes")
 async def list_quotes(admin: dict = Depends(require_admin)):
@@ -1458,6 +1471,8 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
   <button class="nav-item" onclick="show('users',this)"><i class="fa fa-users"></i>მომხმარებლები</button>
   <button class="nav-item" onclick="show('quotes',this)"><i class="fa fa-quote-left"></i>Daily Quotes</button>
   <button class="nav-item" onclick="show('settings',this)"><i class="fa fa-sliders"></i>პარამეტრები</button>
+  <button class="nav-item" onclick="show('chats',this)"><i class="fa fa-message"></i>ჩათ მონიტორი</button>
+  <button class="nav-item" onclick="show('feedback',this)"><i class="fa fa-inbox"></i>Feedback</button>
   <div class="sidebar-foot"><a href="https://aistalin.io" style="color:inherit;text-decoration:none;">← aistalin.io</a></div>
 </aside>
 <main class="main">
@@ -1567,6 +1582,15 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
       </div>
     </div>
   </div>
+  <!-- Announcement Banner -->
+  <div class="card">
+    <div class="card-title"><i class="fa fa-bullhorn"></i> Homepage Announcement</div>
+    <div style="margin-bottom:.75rem">
+      <label>ბანერის ტექსტი (ცარიელი = გამორთული)</label>
+      <input id="s-announce" type="text" placeholder="მაგ: 🚧 ტექნიკური სამუშაოები მიმდინარეობს...">
+    </div>
+    <p style="font-size:.75rem;opacity:.45;margin-top:-.25rem">ჩანს მომხმარებლის ეკრანის ზემოთ — შენახვის შემდეგ მაშინვე.</p>
+  </div>
   <!-- Language -->
   <div class="card">
     <div class="card-title"><i class="fa fa-globe"></i> ენა / Multilingual</div>
@@ -1577,6 +1601,34 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
     </div>
   </div>
   <button class="btn btn-gold" onclick="saveSettings()" style="min-width:130px"><i class="fa fa-save"></i> შენახვა</button>
+</div>
+
+<!-- CHAT MONITOR -->
+<div id="sec-chats" class="section">
+  <div class="page-title">ჩათ მონიტორი <span style="font-size:.8rem;opacity:.5;font-family:Inter,sans-serif;font-weight:400">— ბოლო 20 მოთხოვნა</span></div>
+  <div style="margin-bottom:.75rem;display:flex;justify-content:flex-end">
+    <button class="btn btn-ghost" onclick="loadChats()"><i class="fa fa-refresh"></i> განახლება</button>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>დრო</th><th>მომხმარებელი</th><th>მოთხოვნა</th></tr></thead>
+      <tbody id="ch-tbody"><tr><td colspan="3" style="text-align:center;padding:2rem;opacity:.4">იტვირთება...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- FEEDBACK -->
+<div id="sec-feedback" class="section">
+  <div class="page-title">Feedback Inbox</div>
+  <div style="margin-bottom:.75rem;display:flex;justify-content:flex-end">
+    <button class="btn btn-ghost" onclick="loadFeedback()"><i class="fa fa-refresh"></i> განახლება</button>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>დრო</th><th>სახელი</th><th>ელ-ფოსტა</th><th>შეტყობინება</th></tr></thead>
+      <tbody id="fb-tbody"><tr><td colspan="4" style="text-align:center;padding:2rem;opacity:.4">იტვირთება...</td></tr></tbody>
+    </table>
+  </div>
 </div>
 
 </main></div>
@@ -1793,6 +1845,8 @@ async function loadSettings() {{
     setSlider('s-sc',     'scroll_speed_px','px');
     var lang = document.getElementById('s-lang');
     if(lang && s.ui_lang_default) lang.value = s.ui_lang_default;
+    var ann = document.getElementById('s-announce');
+    if(ann) ann.value = s.announcement_text || '';
   }} catch(e) {{ toast('Settings load failed: '+e.message, false); }}
 }}
 async function saveSettings() {{
@@ -1805,6 +1859,7 @@ async function saveSettings() {{
     ['chat_height_px',   document.getElementById('s-ch').value],
     ['scroll_speed_px',  document.getElementById('s-sc').value],
     ['ui_lang_default',  document.getElementById('s-lang').value],
+    ['announcement_text', document.getElementById('s-announce') ? document.getElementById('s-announce').value : ''],
   ];
   try {{
     var results = await Promise.all(pairs.map(function(p) {{
@@ -1822,11 +1877,82 @@ async function saveSettings() {{
   }} catch(e) {{ toast('შენახვა ვერ მოხერხდა: '+e.message, false); }}
 }}
 
+// ── Chat Monitor ────────────────────────────────────────────────────────────
+async function loadChats() {{
+  var tb = document.getElementById('ch-tbody');
+  if(!tb) return;
+  tb.innerHTML='<tr><td colspan="3" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
+  try {{
+    var r = await fetch(API+'/admin/chats/recent?limit=30', {{headers:getHeaders()}});
+    if(!r.ok) {{ toast('Chats: '+r.status, false); return; }}
+    var rows = await r.json();
+    if(!rows.length) {{ tb.innerHTML='<tr><td colspan="3" style="text-align:center;opacity:.4;padding:1.5rem">ჩათი არ არის</td></tr>'; return; }}
+    tb.innerHTML = rows.map(function(c){{
+      return '<tr><td style="opacity:.45;white-space:nowrap;font-size:.78rem">'+c.at+'</td>'
+        +'<td style="font-size:.82rem;opacity:.7">'+c.user+'</td>'
+        +'<td style="font-family:Playfair Display,serif;font-size:.85rem">'+c.query+'</td></tr>';
+    }}).join('');
+  }} catch(e) {{ toast('Error: '+e.message, false); }}
+}}
+
+// ── Feedback ─────────────────────────────────────────────────────────────────
+async function loadFeedback() {{
+  var tb = document.getElementById('fb-tbody');
+  if(!tb) return;
+  tb.innerHTML='<tr><td colspan="4" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
+  try {{
+    var r = await fetch(API+'/admin/feedback?limit=50', {{headers:getHeaders()}});
+    if(!r.ok) {{ toast('Feedback: '+r.status, false); return; }}
+    var rows = await r.json();
+    if(!rows.length) {{ tb.innerHTML='<tr><td colspan="4" style="text-align:center;opacity:.4;padding:1.5rem">Feedback არ არის</td></tr>'; return; }}
+    tb.innerHTML = rows.map(function(f){{
+      return '<tr><td style="opacity:.45;white-space:nowrap;font-size:.78rem">'+f.at+'</td>'
+        +'<td style="font-size:.82rem">'+f.name+'</td>'
+        +'<td style="font-size:.78rem;opacity:.65">'+f.email+'</td>'
+        +'<td style="font-size:.85rem">'+f.message+'</td></tr>';
+    }}).join('');
+  }} catch(e) {{ toast('Error: '+e.message, false); }}
+}}
+
 // ── Init ────────────────────────────────────────────────────────────────────
 loadStats();
 </script>
 </body></html>"""
 
+
+# ── Recent chats monitor (admin) ──────────────────────────────────────────
+@app.get("/admin/chats/recent")
+async def admin_recent_chats(limit: int = 20, admin: dict = Depends(require_admin)):
+    """Last N chat queries — for monitoring quality and content."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT ch.session_token, ch.query, ch.created_at,
+                      u.email as user_email
+               FROM chat_history ch
+               LEFT JOIN users u ON u.id = ch.user_id
+               ORDER BY ch.created_at DESC LIMIT $1""",
+            limit
+        )
+    return [{"query": r["query"], "user": r["user_email"] or "guest",
+             "at": r["created_at"].strftime("%Y-%m-%d %H:%M")} for r in rows]
+
+
+# ── Feedback inbox (admin) ─────────────────────────────────────────────────
+@app.get("/admin/feedback")
+async def admin_feedback(limit: int = 50, admin: dict = Depends(require_admin)):
+    """User feedback submissions."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, name, email, message, created_at FROM feedback ORDER BY created_at DESC LIMIT $1",
+            limit
+        )
+    return [{"id": r["id"], "name": r["name"], "email": r["email"],
+             "message": r["message"], "at": r["created_at"].strftime("%Y-%m-%d %H:%M")} for r in rows]
+
+
+# ── Homepage announcement banner ──────────────────────────────────────────
+# Admin can set a banner via site_settings key "announcement_text"
+# Frontend reads /settings/public and shows if non-empty
 
 # == SEARCH MODELS ===========================================================
 class SearchRequest(BaseModel):
