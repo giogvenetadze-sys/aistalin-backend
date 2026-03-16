@@ -1518,33 +1518,83 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
 
 <!-- QUOTES -->
 <div id="sec-quotes" class="section">
-  <div class="page-title">Daily Quotes</div>
-  <div class="card">
-    <div class="card-title"><i class="fa fa-plus-circle"></i> ახალი ციტატა</div>
+  <div class="page-title">Daily Quotes
+    <span style="font-size:.8rem;opacity:.45;font-family:Inter,sans-serif;font-weight:400;margin-left:.75rem">
+      — ყოველდღიური ბრუნვა ავტომატურად
+    </span>
+  </div>
+
+  <!-- Add / Edit form -->
+  <div class="card" id="q-form-card">
+    <div class="card-title" id="q-form-title"><i class="fa fa-plus-circle"></i> ახალი ციტატა</div>
+
+    <!-- KA — required -->
     <div style="margin-bottom:.75rem">
-      <label>ტექსტი (ქართული) *</label>
-      <textarea id="q-ka" placeholder="ქართული ტექსტი..."></textarea>
+      <label>ციტატა — ქართული <span style="color:#cc1b1b">*</span></label>
+      <textarea id="q-ka" placeholder="„ციტატის ტექსტი..."" style="min-height:76px"></textarea>
     </div>
+
+    <!-- EN + RU side by side -->
     <div class="grid-2" style="margin-bottom:.75rem">
-      <div><label>English</label><textarea id="q-en" placeholder="English text..." style="min-height:60px"></textarea></div>
-      <div><label>Русский</label><textarea id="q-ru" placeholder="Русский текст..." style="min-height:60px"></textarea></div>
-    </div>
-    <div class="grid-2" style="margin-bottom:1rem">
-      <div><label>წყარო (მაგ: ტომი 11, გვ. 34)</label><input id="q-src" type="text" placeholder="ტომი X"></div>
-      <div style="display:flex;align-items:flex-end;padding-bottom:.1rem">
-        <label style="margin:0;margin-right:.75rem">სტატუსი:</label>
-        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;opacity:1">
-          <input type="checkbox" id="q-active" checked style="accent-color:var(--gold);width:15px;height:15px">
-          <span>აქტიური</span>
-        </label>
+      <div>
+        <label>English translation <span style="opacity:.45">(optional)</span></label>
+        <textarea id="q-en" placeholder='"Quote text..."' style="min-height:62px"></textarea>
+      </div>
+      <div>
+        <label>Русский перевод <span style="opacity:.45">(optional)</span></label>
+        <textarea id="q-ru" placeholder='„Цитата..."' style="min-height:62px"></textarea>
       </div>
     </div>
-    <button class="btn btn-gold" onclick="addQuote()"><i class="fa fa-plus"></i> დამატება</button>
+
+    <!-- Source + Active -->
+    <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1rem;align-items:flex-end">
+      <div style="flex:1;min-width:180px">
+        <label>წყარო <span style="opacity:.45">(მაგ: ტომი 11, გვ. 34)</span></label>
+        <input id="q-src" type="text" placeholder="ტომი X">
+      </div>
+      <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;padding-bottom:.45rem;white-space:nowrap">
+        <input type="checkbox" id="q-active" checked style="accent-color:var(--gold);width:16px;height:16px">
+        <span style="font-size:.85rem">აქტიური (ჩვენება ჩართული)</span>
+      </label>
+    </div>
+
+    <div style="display:flex;gap:.65rem;flex-wrap:wrap">
+      <button id="q-submit-btn" class="btn btn-gold" onclick="submitQuote()">
+        <i class="fa fa-plus"></i> <span id="q-submit-label">დამატება</span>
+      </button>
+      <button id="q-cancel-btn" class="btn btn-ghost" onclick="cancelEditQuote()" style="display:none">
+        <i class="fa fa-xmark"></i> გაუქმება
+      </button>
+    </div>
   </div>
+
+  <!-- Stats bar -->
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.6rem;flex-wrap:wrap;gap:.4rem">
+    <span id="q-count-label" style="font-size:.78rem;opacity:.45"></span>
+    <button class="btn btn-ghost btn-sm" onclick="loadQuotes()">
+      <i class="fa fa-refresh"></i> განახლება
+    </button>
+  </div>
+
+  <!-- Responsive table -->
   <div class="tbl-wrap">
     <table>
-      <thead><tr><th>#</th><th>ციტატა (KA)</th><th class="hide-m">წყარო</th><th>EN</th><th>RU</th><th>სტატ.</th><th>მოქმ.</th></tr></thead>
-      <tbody id="q-tbody"><tr><td colspan="7" style="text-align:center;padding:2rem;opacity:.4">იტვირთება...</td></tr></tbody>
+      <thead>
+        <tr>
+          <th style="width:2.5rem">#</th>
+          <th>ციტატა (KA)</th>
+          <th class="hide-m" style="width:7rem">წყარო</th>
+          <th class="hide-m" style="width:3rem">EN</th>
+          <th class="hide-m" style="width:3rem">RU</th>
+          <th style="width:4rem">სტატ.</th>
+          <th style="width:7rem">მოქმ.</th>
+        </tr>
+      </thead>
+      <tbody id="q-tbody">
+        <tr><td colspan="7" style="text-align:center;padding:2.5rem;opacity:.35">
+          <i class="fa fa-spinner fa-spin" style="margin-right:.5rem"></i>იტვირთება...
+        </td></tr>
+      </tbody>
     </table>
   </div>
 </div>
@@ -1579,17 +1629,23 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
     <div class="card-title"><i class="fa fa-comments"></i> Chat UI</div>
     <div class="grid-2">
       <div>
-        <label>💬 Chat Height (px) — chat message window-ის სიმაღლე</label>
+        <label>💬 Chat Height (px) — ჩათ-ფანჯრის სიმაღლე</label>
         <div class="range-row"><input type="range" min="200" max="800" step="20" id="s-ch" oninput="rv('s-ch-v',this.value,'px')"><span id="s-ch-v">400px</span></div>
       </div>
       <div>
-        <label>💬 Chat Scroll Speed (px) — ჩათ-ფანჯრის სქროლი</label>
-        <div class="range-row"><input type="range" min="5" max="150" step="5" id="s-sc-chat" oninput="rv('s-sc-chat-v',this.value,'px')"><span id="s-sc-chat-v">38px</span></div>
+        <label>↔ Chat Width (%) — სიგანე desktop-ზე (30–70%)</label>
+        <div class="range-row"><input type="range" min="30" max="70" step="5" id="s-cw" oninput="rv('s-cw-v',this.value,'%')"><span id="s-cw-v">50%</span></div>
       </div>
     </div>
-    <div style="margin-top:.85rem;max-width:480px">
-      <label>📖 Reader Scroll Speed (px) — წიგნის კითხვის პანელის სქროლი</label>
-      <div class="range-row"><input type="range" min="5" max="200" step="5" id="s-sc-reader" oninput="rv('s-sc-reader-v',this.value,'px')"><span id="s-sc-reader-v">55px</span></div>
+    <div class="grid-2" style="margin-top:.85rem">
+      <div>
+        <label>💬 Chat Scroll Speed (px)</label>
+        <div class="range-row"><input type="range" min="5" max="150" step="5" id="s-sc-chat" oninput="rv('s-sc-chat-v',this.value,'px')"><span id="s-sc-chat-v">38px</span></div>
+      </div>
+      <div>
+        <label>📖 Reader Scroll Speed (px)</label>
+        <div class="range-row"><input type="range" min="5" max="200" step="5" id="s-sc-reader" oninput="rv('s-sc-reader-v',this.value,'px')"><span id="s-sc-reader-v">55px</span></div>
+      </div>
     </div>
   </div>
   <!-- Donate Settings -->
@@ -1767,91 +1823,144 @@ async function togglePremium(uid, grant) {{
 
 // ── Quotes ─────────────────────────────────────────────────────────────────
 var _editingQuoteId = null;
+var _quotesCache    = [];  // cache for edit lookups
+
 async function loadQuotes() {{
-  var tb = document.getElementById('q-tbody');
-  tb.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
+  var tb  = document.getElementById('q-tbody');
+  var lbl = document.getElementById('q-count-label');
+  if(!tb) return;
+  tb.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:2rem;opacity:.35">' +
+    '<i class="fa fa-spinner fa-spin" style="margin-right:.5rem"></i>იტვირთება...</td></tr>';
   try {{
     var r = await fetch(API+'/admin/quotes', {{headers:getHeaders()}});
     if(!r.ok) {{ toast('Quotes: '+r.status, false); return; }}
-    var quotes = await r.json();
-    if(!quotes.length) {{ tb.innerHTML='<tr><td colspan="7" style="text-align:center;opacity:.4;padding:1.5rem">ციტატები არ არის. დაამატეთ ზემოდან.</td></tr>'; return; }}
-    tb.innerHTML = quotes.map(function(q) {{
-      var preview = (q.text_ka||'').substring(0,60)+(q.text_ka&&q.text_ka.length>60?'…':'');
-      return '<tr id="qrow-'+q.id+'">'
-        +'<td style="opacity:.5">'+q.id+'</td>'
-        +'<td style="font-family:Playfair Display,serif;font-size:.82rem;max-width:260px" title="'+q.text_ka.replace(/"/g,"&quot;")+'">'+preview+'</td>'
-        +'<td class="hide-m" style="opacity:.5;font-size:.8rem">'+(q.source||'—')+'</td>'
-        +'<td style="font-size:.75rem;opacity:.65">'+(q.text_en?'✓':'—')+'</td>'
-        +'<td style="font-size:.75rem;opacity:.65">'+(q.text_ru?'✓':'—')+'</td>'
-        +'<td>'+(q.is_active?'<span class="badge badge-green">●</span>':'<span class="badge badge-gray">○</span>')+'</td>'
-        +'<td style="display:flex;gap:.3rem;flex-wrap:wrap">'
-        +'<button class="btn btn-sm btn-ghost" onclick="editQuote('+q.id+')"><i class="fa fa-pen"></i></button>'
-        +'<button class="btn btn-sm '+(q.is_active?'btn-ghost':'btn-green')+'" onclick="toggleQuoteActive('+q.id+','+(q.is_active?'false':'true')+')" title="'+(q.is_active?'Off':'On')+'">'+(q.is_active?'Off':'On')+'</button>'
-        +'<button class="btn btn-sm btn-red" onclick="deleteQuote('+q.id+')"><i class="fa fa-trash"></i></button>'
-        +'</td></tr>';
+    _quotesCache = await r.json();
+    if(lbl) lbl.textContent = 'სულ: '+_quotesCache.length+' ციტატა · '+
+      _quotesCache.filter(function(q){{return q.is_active;}}).length+' აქტიური';
+    if(!_quotesCache.length) {{
+      tb.innerHTML='<tr><td colspan="7" style="text-align:center;opacity:.35;padding:2.5rem">' +
+        '<i class="fa fa-quote-left" style="font-size:1.5rem;display:block;margin-bottom:.5rem;opacity:.4"></i>' +
+        'ციტატები არ არის. ზემოთ ფორმაში დაამატეთ.</td></tr>';
+      return;
+    }}
+    tb.innerHTML = _quotesCache.map(function(q,idx) {{
+      var preview = (q.text_ka||'').substring(0,65) + (q.text_ka&&q.text_ka.length>65?'…':'');
+      var rowStyle = _editingQuoteId===q.id ? 'background:rgba(212,160,23,.06);' : '';
+      return '<tr id="qrow-'+q.id+'" style="'+rowStyle+'">'
+        +'<td style="opacity:.4;font-size:.8rem">'+(idx+1)+'</td>'
+        +'<td style="font-family:Playfair Display,serif;font-size:.85rem;max-width:280px" title="'+(q.text_ka||'').replace(/"/g,"&quot;")+'">'+preview+'</td>'
+        +'<td class="hide-m" style="opacity:.5;font-size:.8rem;white-space:nowrap">'+(q.source||'—')+'</td>'
+        +'<td class="hide-m" style="text-align:center">'+(q.text_en?'<span style="color:#66bb6a;font-size:.85rem">✓</span>':'<span style="opacity:.3">—</span>')+'</td>'
+        +'<td class="hide-m" style="text-align:center">'+(q.text_ru?'<span style="color:#66bb6a;font-size:.85rem">✓</span>':'<span style="opacity:.3">—</span>')+'</td>'
+        +'<td>'+(q.is_active
+          ? '<span class="badge badge-green" style="cursor:pointer" onclick="toggleQuoteActive('+q.id+',false)" title="დეაქტივაცია">● On</span>'
+          : '<span class="badge badge-gray" style="cursor:pointer" onclick="toggleQuoteActive('+q.id+',true)" title="გააქტიურება">○ Off</span>')+'</td>'
+        +'<td><div style="display:flex;gap:.3rem">'
+        +'<button class="btn btn-sm btn-ghost" onclick="editQuote('+q.id+')" title="რედაქტირება"><i class="fa fa-pen"></i></button>'
+        +'<button class="btn btn-sm btn-red" onclick="deleteQuote('+q.id+')" title="წაშლა"><i class="fa fa-trash"></i></button>'
+        +'</div></td></tr>';
     }}).join('');
   }} catch(e) {{ toast('Error: '+e.message, false); }}
 }}
+
 function editQuote(id) {{
-  fetch(API+'/admin/quotes', {{headers:getHeaders()}}).then(function(r){{return r.json();}}).then(function(quotes){{
-    var q = quotes.find(function(x){{return x.id===id;}});
-    if(!q) return;
-    document.getElementById('q-ka').value = q.text_ka||'';
-    document.getElementById('q-en').value = q.text_en||'';
-    document.getElementById('q-ru').value = q.text_ru||'';
-    document.getElementById('q-src').value = q.source||'';
-    document.getElementById('q-active').checked = q.is_active;
-    _editingQuoteId = id;
-    var btn = document.querySelector('[onclick="addQuote()"]');
-    if(btn) {{ btn.innerHTML='<i class="fa fa-save"></i> განახლება #'+id; btn.className='btn btn-green'; }}
-    document.getElementById('q-ka').focus();
-    document.getElementById('q-ka').scrollIntoView({{behavior:'smooth',block:'center'}});
-  }});
+  var q = _quotesCache.find(function(x){{return x.id===id;}});
+  if(!q) {{
+    // fallback fetch if cache miss
+    fetch(API+'/admin/quotes', {{headers:getHeaders()}})
+      .then(function(r){{return r.json();}})
+      .then(function(quotes){{ _quotesCache=quotes; editQuote(id); }});
+    return;
+  }}
+  document.getElementById('q-ka').value     = q.text_ka  || '';
+  document.getElementById('q-en').value     = q.text_en  || '';
+  document.getElementById('q-ru').value     = q.text_ru  || '';
+  document.getElementById('q-src').value    = q.source   || '';
+  document.getElementById('q-active').checked = q.is_active;
+  _editingQuoteId = id;
+  // Update form UI
+  var titleEl = document.getElementById('q-form-title');
+  var submitLbl = document.getElementById('q-submit-label');
+  var cancelBtn = document.getElementById('q-cancel-btn');
+  var submitBtn = document.getElementById('q-submit-btn');
+  if(titleEl)   titleEl.innerHTML  = '<i class="fa fa-pen"></i> ციტატის რედაქტირება #'+id;
+  if(submitLbl) submitLbl.textContent = 'შენახვა';
+  if(submitBtn) {{submitBtn.className='btn btn-green';}}
+  if(cancelBtn) cancelBtn.style.display='inline-flex';
+  // Highlight row
+  document.querySelectorAll('#q-tbody tr').forEach(function(row){{row.style.background='';}});
+  var row = document.getElementById('qrow-'+id);
+  if(row) row.style.background='rgba(212,160,23,.06)';
+  // Scroll to form
+  var form = document.getElementById('q-form-card');
+  if(form) form.scrollIntoView({{behavior:'smooth', block:'start'}});
+  document.getElementById('q-ka').focus();
+  toast('✎ ციტატა #'+id+' — რედაქტირების რეჟიმი', true);
 }}
-async function addQuote() {{
+
+function cancelEditQuote() {{
+  _editingQuoteId = null;
+  ['q-ka','q-en','q-ru','q-src'].forEach(function(id){{
+    var el = document.getElementById(id);
+    if(el) el.value='';
+  }});
+  document.getElementById('q-active').checked = true;
+  var titleEl   = document.getElementById('q-form-title');
+  var submitLbl = document.getElementById('q-submit-label');
+  var cancelBtn = document.getElementById('q-cancel-btn');
+  var submitBtn = document.getElementById('q-submit-btn');
+  if(titleEl)   titleEl.innerHTML  = '<i class="fa fa-plus-circle"></i> ახალი ციტატა';
+  if(submitLbl) submitLbl.textContent = 'დამატება';
+  if(submitBtn) submitBtn.className = 'btn btn-gold';
+  if(cancelBtn) cancelBtn.style.display = 'none';
+  document.querySelectorAll('#q-tbody tr').forEach(function(row){{row.style.background='';}});
+}}
+
+async function submitQuote() {{
   var ka = document.getElementById('q-ka').value.trim();
-  if(!ka) {{ toast('⚠ ქართული ტექსტი სავალდებულოა', false); return; }}
+  if(!ka) {{ toast('⚠ ქართული ტექსტი სავალდებულოა', false); document.getElementById('q-ka').focus(); return; }}
   var body = {{
-    text_ka: ka,
-    text_en: document.getElementById('q-en').value.trim()||null,
-    text_ru: document.getElementById('q-ru').value.trim()||null,
-    source:  document.getElementById('q-src').value.trim()||null,
+    text_ka:   ka,
+    text_en:   document.getElementById('q-en').value.trim() || null,
+    text_ru:   document.getElementById('q-ru').value.trim() || null,
+    source:    document.getElementById('q-src').value.trim() || null,
     is_active: document.getElementById('q-active').checked
   }};
   try {{
-    var url = _editingQuoteId ? API+'/admin/quotes/'+_editingQuoteId : API+'/admin/quotes';
+    var url    = _editingQuoteId ? API+'/admin/quotes/'+_editingQuoteId : API+'/admin/quotes';
     var method = _editingQuoteId ? 'PUT' : 'POST';
     var r = await fetch(url, {{method:method, headers:getHeaders(), body:JSON.stringify(body)}});
-    if(!r.ok) {{ toast('შენახვა ვერ მოხერხდა: '+r.status, false); return; }}
-    toast(_editingQuoteId ? '✓ ციტატა განახლდა' : '✓ ციტატა დაემატა', true);
-    // Reset form
-    ['q-ka','q-en','q-ru','q-src'].forEach(function(id){{document.getElementById(id).value='';}});
-    document.getElementById('q-active').checked=true;
-    _editingQuoteId=null;
-    var btn=document.querySelector('[onclick="addQuote()"]');
-    if(btn){{btn.innerHTML='<i class="fa fa-plus"></i> დამატება';btn.className='btn btn-gold';}}
+    if(!r.ok) {{ toast('შენახვა ვერ მოხერხდა ('+r.status+')', false); return; }}
+    toast(_editingQuoteId ? '✓ ციტატა #'+_editingQuoteId+' განახლდა' : '✓ ციტატა დაემატა', true);
+    cancelEditQuote();
     loadQuotes();
   }} catch(e) {{ toast('Error: '+e.message, false); }}
 }}
+
+// Keep old addQuote() as alias for compatibility
+function addQuote() {{ submitQuote(); }}
+
 async function toggleQuoteActive(id, active) {{
+  var q = _quotesCache.find(function(x){{return x.id===id;}});
+  if(!q) return;
   try {{
-    var r = await fetch(API+'/admin/quotes', {{headers:getHeaders()}});
-    var quotes = await r.json();
-    var q = quotes.find(function(x){{return x.id===id;}});
-    if(!q) return;
-    var r2 = await fetch(API+'/admin/quotes/'+id, {{method:'PUT',headers:getHeaders(),
-      body:JSON.stringify({{text_ka:q.text_ka,text_en:q.text_en,text_ru:q.text_ru,source:q.source,is_active:active}})}});
-    if(!r2.ok) {{ toast('Error: '+r2.status, false); return; }}
-    toast(active ? '✓ ციტატა გააქტიურდა' : '✓ ციტატა გამოირთო', true);
+    var r = await fetch(API+'/admin/quotes/'+id, {{
+      method:'PUT', headers:getHeaders(),
+      body:JSON.stringify({{text_ka:q.text_ka,text_en:q.text_en,text_ru:q.text_ru,source:q.source,is_active:active}})
+    }});
+    if(!r.ok) {{ toast('Error: '+r.status, false); return; }}
+    toast(active ? '✓ ციტატა გააქტიურდა' : '✓ გამოირთო', true);
     loadQuotes();
   }} catch(e) {{ toast('Error: '+e.message, false); }}
 }}
+
 async function deleteQuote(id) {{
-  if(!confirm('ციტატა #'+id+' წაიშლება. დარწმუნებული ხართ?')) return;
+  if(!confirm('ციტატა #'+id+' სამუდამოდ წაიშლება. გაგრძელება?')) return;
   try {{
-    var r = await fetch(API+'/admin/quotes/'+id, {{method:'DELETE',headers:getHeaders()}});
+    var r = await fetch(API+'/admin/quotes/'+id, {{method:'DELETE', headers:getHeaders()}});
     if(!r.ok) {{ toast('წაშლა ვერ მოხერხდა: '+r.status, false); return; }}
-    toast('✓ ციტატა წაიშალა', true);
+    toast('✓ ციტატა #'+id+' წაიშალა', true);
+    if(_editingQuoteId===id) cancelEditQuote();
     loadQuotes();
   }} catch(e) {{ toast('Error: '+e.message, false); }}
 }}
@@ -1877,6 +1986,7 @@ async function loadSettings() {{
     setSlider('s-ring',   'ring_volume',    '%');
     setSlider('s-mutesfx','mutesfx_volume', '%');
     setSlider('s-ch',        'chat_height_px',   'px');
+    setSlider('s-cw',        'chat_width_pct',   '%');
     setSlider('s-sc-chat',   'chat_scroll_px',   'px');
     setSlider('s-sc-reader', 'reader_scroll_px', 'px');
     var lang = document.getElementById('s-lang');
@@ -1901,6 +2011,7 @@ async function saveSettings() {{
     ['ring_volume',      document.getElementById('s-ring').value],
     ['mutesfx_volume',   document.getElementById('s-mutesfx').value],
     ['chat_height_px',    document.getElementById('s-ch').value],
+    ['chat_width_pct',    document.getElementById('s-cw') ? document.getElementById('s-cw').value : '50'],
     ['chat_scroll_px',    document.getElementById('s-sc-chat').value],
     ['reader_scroll_px',  document.getElementById('s-sc-reader').value],
     ['ui_lang_default',  document.getElementById('s-lang').value],
