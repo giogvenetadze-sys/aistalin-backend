@@ -212,6 +212,11 @@ async def _create_tables():
             ("chat_scroll_px",    "38"),   # chat messages panel scroll speed
             ("reader_scroll_px",  "55"),   # reader body panel scroll speed
             ("ui_lang_default",   "ka"),
+            # Donate settings
+            ("usdt_address",      "TNBNAYUxbw9LNqbmRjb8EAJ3gL9d19Sbb5"),
+            ("usdt_qr_url",       ""),     # custom QR image URL (empty = auto-generate)
+            ("paddle_link_5",     ""),     # direct Paddle/Stripe link for $5
+            ("paddle_link_10",    ""),     # direct Paddle/Stripe link for $10
         ]
         for k, v in defaults:
             await conn.execute(
@@ -1587,6 +1592,31 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
       <div class="range-row"><input type="range" min="5" max="200" step="5" id="s-sc-reader" oninput="rv('s-sc-reader-v',this.value,'px')"><span id="s-sc-reader-v">55px</span></div>
     </div>
   </div>
+  <!-- Donate Settings -->
+  <div class="card">
+    <div class="card-title"><i class="fa fa-hand-holding-heart" style="color:#cc1b1b"></i> Donate Settings</div>
+    <div class="grid-2" style="margin-bottom:.75rem">
+      <div>
+        <label>USDT TRC-20 მისამართი</label>
+        <input id="s-usdt-addr" type="text" placeholder="TNBNAYUxbw9LNqbmRjb8EAJ3gL9d19Sbb5">
+      </div>
+      <div>
+        <label>QR კოდის URL (ცარიელი = ავტო)</label>
+        <input id="s-usdt-qr" type="text" placeholder="https://...qr.png">
+      </div>
+    </div>
+    <div class="grid-2">
+      <div>
+        <label>$5 Paddle/Stripe ლინკი</label>
+        <input id="s-paddle5" type="text" placeholder="https://buy.paddle.com/...">
+      </div>
+      <div>
+        <label>$10 Paddle/Stripe ლინკი</label>
+        <input id="s-paddle10" type="text" placeholder="https://buy.paddle.com/...">
+      </div>
+    </div>
+  </div>
+
   <!-- Announcement Banner -->
   <div class="card">
     <div class="card-title"><i class="fa fa-bullhorn"></i> Homepage Announcement</div>
@@ -1853,6 +1883,14 @@ async function loadSettings() {{
     if(lang && s.ui_lang_default) lang.value = s.ui_lang_default;
     var ann = document.getElementById('s-announce');
     if(ann) ann.value = s.announcement_text || '';
+    var uAddr = document.getElementById('s-usdt-addr');
+    if(uAddr) uAddr.value = s.usdt_address || '';
+    var uQr = document.getElementById('s-usdt-qr');
+    if(uQr) uQr.value = s.usdt_qr_url || '';
+    var p5 = document.getElementById('s-paddle5');
+    if(p5) p5.value = s.paddle_link_5 || '';
+    var p10 = document.getElementById('s-paddle10');
+    if(p10) p10.value = s.paddle_link_10 || '';
   }} catch(e) {{ toast('Settings load failed: '+e.message, false); }}
 }}
 async function saveSettings() {{
@@ -1867,6 +1905,10 @@ async function saveSettings() {{
     ['reader_scroll_px',  document.getElementById('s-sc-reader').value],
     ['ui_lang_default',  document.getElementById('s-lang').value],
     ['announcement_text', document.getElementById('s-announce') ? document.getElementById('s-announce').value : ''],
+    ['usdt_address',      document.getElementById('s-usdt-addr')  ? document.getElementById('s-usdt-addr').value  : ''],
+    ['usdt_qr_url',       document.getElementById('s-usdt-qr')    ? document.getElementById('s-usdt-qr').value    : ''],
+    ['paddle_link_5',     document.getElementById('s-paddle5')    ? document.getElementById('s-paddle5').value    : ''],
+    ['paddle_link_10',    document.getElementById('s-paddle10')   ? document.getElementById('s-paddle10').value   : ''],
   ];
   try {{
     var results = await Promise.all(pairs.map(function(p) {{
