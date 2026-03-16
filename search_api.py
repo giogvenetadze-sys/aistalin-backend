@@ -202,15 +202,16 @@ async def _create_tables():
     async with db_pool.acquire() as conn:
         defaults = [
             # Audio volumes (0-100 scale, divided by 100 for actual JS volume)
-            ("bg_music_volume",  "13"),
-            ("lamp_volume",      "55"),
-            ("book_volume",      "30"),
-            ("ring_volume",      "39"),
-            ("mutesfx_volume",   "50"),
-            # UI settings
-            ("chat_height_px",   "400"),
-            ("scroll_speed_px",  "38"),
-            ("ui_lang_default",  "ka"),
+            ("bg_music_volume",   "13"),
+            ("lamp_volume",       "55"),
+            ("book_volume",       "30"),
+            ("ring_volume",       "39"),
+            ("mutesfx_volume",    "50"),
+            # Chat UI
+            ("chat_height_px",    "400"),
+            ("chat_scroll_px",    "38"),   # chat messages panel scroll speed
+            ("reader_scroll_px",  "55"),   # reader body panel scroll speed
+            ("ui_lang_default",   "ka"),
         ]
         for k, v in defaults:
             await conn.execute(
@@ -1573,13 +1574,17 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
     <div class="card-title"><i class="fa fa-comments"></i> Chat UI</div>
     <div class="grid-2">
       <div>
-        <label>Chat Height (px)</label>
+        <label>💬 Chat Height (px) — chat message window-ის სიმაღლე</label>
         <div class="range-row"><input type="range" min="200" max="800" step="20" id="s-ch" oninput="rv('s-ch-v',this.value,'px')"><span id="s-ch-v">400px</span></div>
       </div>
       <div>
-        <label>Scroll Speed (px / wheel tick)</label>
-        <div class="range-row"><input type="range" min="10" max="100" step="5" id="s-sc" oninput="rv('s-sc-v',this.value,'px')"><span id="s-sc-v">38px</span></div>
+        <label>💬 Chat Scroll Speed (px) — ჩათ-ფანჯრის სქროლი</label>
+        <div class="range-row"><input type="range" min="5" max="150" step="5" id="s-sc-chat" oninput="rv('s-sc-chat-v',this.value,'px')"><span id="s-sc-chat-v">38px</span></div>
       </div>
+    </div>
+    <div style="margin-top:.85rem;max-width:480px">
+      <label>📖 Reader Scroll Speed (px) — წიგნის კითხვის პანელის სქროლი</label>
+      <div class="range-row"><input type="range" min="5" max="200" step="5" id="s-sc-reader" oninput="rv('s-sc-reader-v',this.value,'px')"><span id="s-sc-reader-v">55px</span></div>
     </div>
   </div>
   <!-- Announcement Banner -->
@@ -1841,8 +1846,9 @@ async function loadSettings() {{
     setSlider('s-book',   'book_volume',    '%');
     setSlider('s-ring',   'ring_volume',    '%');
     setSlider('s-mutesfx','mutesfx_volume', '%');
-    setSlider('s-ch',     'chat_height_px', 'px');
-    setSlider('s-sc',     'scroll_speed_px','px');
+    setSlider('s-ch',        'chat_height_px',   'px');
+    setSlider('s-sc-chat',   'chat_scroll_px',   'px');
+    setSlider('s-sc-reader', 'reader_scroll_px', 'px');
     var lang = document.getElementById('s-lang');
     if(lang && s.ui_lang_default) lang.value = s.ui_lang_default;
     var ann = document.getElementById('s-announce');
@@ -1856,8 +1862,9 @@ async function saveSettings() {{
     ['book_volume',      document.getElementById('s-book').value],
     ['ring_volume',      document.getElementById('s-ring').value],
     ['mutesfx_volume',   document.getElementById('s-mutesfx').value],
-    ['chat_height_px',   document.getElementById('s-ch').value],
-    ['scroll_speed_px',  document.getElementById('s-sc').value],
+    ['chat_height_px',    document.getElementById('s-ch').value],
+    ['chat_scroll_px',    document.getElementById('s-sc-chat').value],
+    ['reader_scroll_px',  document.getElementById('s-sc-reader').value],
     ['ui_lang_default',  document.getElementById('s-lang').value],
     ['announcement_text', document.getElementById('s-announce') ? document.getElementById('s-announce').value : ''],
   ];
