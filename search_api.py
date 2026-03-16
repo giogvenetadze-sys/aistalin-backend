@@ -201,10 +201,14 @@ async def _create_tables():
     # THEN seed default settings (table now exists)
     async with db_pool.acquire() as conn:
         defaults = [
-            ("ambient_volume",   "13"),
-            ("music_volume",     "13"),
+            # Audio volumes (0-100 scale, divided by 100 for actual JS volume)
+            ("bg_music_volume",  "13"),
+            ("lamp_volume",      "55"),
+            ("book_volume",      "30"),
+            ("ring_volume",      "39"),
+            ("mutesfx_volume",   "50"),
+            # UI settings
             ("chat_height_px",   "400"),
-            ("chat_width_pct",   "100"),
             ("scroll_speed_px",  "38"),
             ("ui_lang_default",  "ka"),
         ]
@@ -1288,7 +1292,7 @@ async def _optional_admin(
 @app.get("/admin/dashboard", response_class=HTMLResponse)
 async def admin_dashboard(
     request: Request,
-    admin: dict = Depends(_optional_admin),
+    admin: dict = Depends(_optional_admin),   # type: ignore[assignment]
 ):
     """
     Full admin control panel.
@@ -1332,13 +1336,27 @@ async def admin_dashboard(
             status_code=403
         )
 
-    return _admin_dashboard_html(email)
+    # Retrieve the original JWT to embed in dashboard sessionStorage
+    # The one-time token was already consumed; we now pass the real JWT
+    # so the dashboard can make authenticated API calls
+    raw_jwt = ""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        raw_jwt = auth_header[7:]
+    # Also try to get from qtoken flow (we stored email, not raw jwt)
+    # For qtoken flow, we issue a fresh admin JWT
+    if not raw_jwt and email:
+        # Create a short-lived JWT for the dashboard tab
+        raw_jwt = create_jwt(0, email, "admin", False)
+
+    return _admin_dashboard_html(email, jwt_token=raw_jwt)
 
 
 
 
 
-def _admin_dashboard_html(admin_email: str) -> str:
+def _admin_dashboard_html(admin_email: str, jwt_token: str = "") -> str:
+    """Self-contained admin dashboard. JWT passed via sessionStorage on load."""
     api = "https://aistalin-backend-production.up.railway.app"
     return f"""<!doctype html><html lang="ka"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1351,474 +1369,463 @@ def _admin_dashboard_html(admin_email: str) -> str:
   --red:#cc1b1b;--green:#4caf50;--r:8px}}
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{background:var(--bg);color:var(--cream2);font-family:'Inter',sans-serif;font-size:14px;min-height:100vh}}
-/* Layout */
 .shell{{display:flex;min-height:100vh}}
 .sidebar{{width:220px;flex-shrink:0;background:var(--bg2);border-right:1px solid var(--border);
-  padding:1.5rem 0;display:flex;flex-direction:column;position:sticky;top:0;height:100vh}}
+  padding:1.5rem 0;display:flex;flex-direction:column;position:sticky;top:0;height:100vh;overflow-y:auto}}
 .main{{flex:1;padding:2rem;overflow-x:hidden;max-width:100%}}
 @media(max-width:768px){{
   .shell{{flex-direction:column}}
-  .sidebar{{width:100%;height:auto;flex-direction:row;flex-wrap:wrap;padding:.75rem;
-    position:relative;gap:.25rem}}
+  .sidebar{{width:100%;height:auto;position:relative;padding:.5rem;display:flex;flex-direction:row;flex-wrap:wrap;gap:.25rem}}
   .main{{padding:1rem}}
-  .sidebar .logo{{width:100%;margin-bottom:.5rem}}
-  .sidebar a{{padding:.4rem .75rem;font-size:.8rem}}
-  .grid-4,.grid-3{{grid-template-columns:repeat(2,1fr)}}
-  .grid-2{{grid-template-columns:1fr}}
-  table{{font-size:.8rem}}
-  .hide-mobile{{display:none}}
+  .sidebar .logo{{width:100%;padding:.5rem;margin-bottom:.25rem}}
+  .sidebar-foot{{display:none}}
+  .grid-4{{grid-template-columns:repeat(2,1fr)!important}}
+  .grid-3{{grid-template-columns:repeat(2,1fr)!important}}
+  .grid-2{{grid-template-columns:1fr!important}}
+  table th.hide-m,table td.hide-m{{display:none}}
 }}
-@media(max-width:480px){{
-  .grid-4,.grid-3,.grid-2{{grid-template-columns:1fr}}
-  .main{{padding:.75rem}}
-}}
-/* Sidebar */
-.logo{{padding:0 1.25rem 1.25rem;border-bottom:1px solid var(--border);margin-bottom:.75rem}}
-.logo h1{{font-family:'Playfair Display',serif;font-size:1.1rem;color:var(--gold);letter-spacing:.08em}}
-.logo p{{font-size:.68rem;color:rgba(212,184,150,.4);margin-top:.2rem}}
-.nav-item{{display:flex;align-items:center;gap:.6rem;padding:.6rem 1.25rem;
-  color:var(--cream2);text-decoration:none;transition:all .18s;cursor:pointer;
-  border:none;background:none;width:100%;font-size:.85rem;font-family:'Inter',sans-serif}}
-.nav-item:hover,.nav-item.active{{background:rgba(212,160,23,.08);color:var(--gold);
-  border-left:2px solid var(--gold)}}
-.nav-item i{{width:16px;opacity:.7}}
-.sidebar-foot{{margin-top:auto;padding:1rem 1.25rem;border-top:1px solid var(--border);
-  font-size:.72rem;color:rgba(212,184,150,.35)}}
-/* Sections */
+.logo{{padding:0 1.25rem 1rem;border-bottom:1px solid var(--border);margin-bottom:.5rem}}
+.logo h1{{font-family:'Playfair Display',serif;font-size:1.05rem;color:var(--gold);letter-spacing:.08em}}
+.logo p{{font-size:.68rem;color:rgba(212,184,150,.4);margin-top:.2rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.nav-item{{display:flex;align-items:center;gap:.6rem;padding:.55rem 1.2rem;
+  color:var(--cream2);text-decoration:none;cursor:pointer;border:none;background:none;
+  width:100%;font-size:.85rem;font-family:'Inter',sans-serif;transition:all .15s;
+  border-left:2px solid transparent}}
+.nav-item:hover,.nav-item.active{{background:rgba(212,160,23,.08);color:var(--gold);border-left-color:var(--gold)}}
+.nav-item i{{width:16px;opacity:.7;font-size:.82rem}}
+.sidebar-foot{{margin-top:auto;padding:1rem 1.25rem;border-top:1px solid var(--border);font-size:.72rem;color:rgba(212,184,150,.35)}}
 .section{{display:none}}.section.active{{display:block}}
-.section-title{{font-family:'Playfair Display',serif;font-size:1.3rem;color:var(--gold);
+.page-title{{font-family:'Playfair Display',serif;font-size:1.3rem;color:var(--gold);
   margin-bottom:1.5rem;padding-bottom:.6rem;border-bottom:1px solid var(--border)}}
-/* Cards */
-.card{{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
-  padding:1.25rem;margin-bottom:1rem}}
-.card-title{{font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;
-  color:rgba(212,184,150,.5);margin-bottom:.75rem}}
-/* Stat cards */
+.card{{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:1.25rem;margin-bottom:1rem}}
+.card-title{{font-size:.72rem;text-transform:uppercase;letter-spacing:.1em;color:rgba(212,184,150,.45);margin-bottom:.85rem;display:flex;align-items:center;gap:.5rem}}
 .grid-4{{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:1.5rem}}
-.grid-3{{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem}}
+.grid-3{{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-bottom:1rem}}
 .grid-2{{display:grid;grid-template-columns:repeat(2,1fr);gap:1rem}}
-.stat-card{{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);
-  padding:1.25rem;text-align:center}}
+.stat-card{{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r);padding:1.25rem;text-align:center}}
 .stat-num{{font-family:'Playfair Display',serif;font-size:2rem;color:var(--gold);line-height:1}}
-.stat-lbl{{font-size:.72rem;color:rgba(212,184,150,.5);margin-top:.35rem;letter-spacing:.05em}}
-/* Form elements */
-label{{display:block;font-size:.75rem;color:var(--cream2);margin-bottom:.4rem;opacity:.8}}
+.stat-lbl{{font-size:.7rem;color:rgba(212,184,150,.45);margin-top:.3rem;letter-spacing:.06em}}
+label{{display:block;font-size:.75rem;color:var(--cream2);margin-bottom:.35rem;opacity:.8}}
 input[type=text],input[type=number],textarea,select{{
-  width:100%;background:rgba(15,5,2,.7);border:1px solid var(--border);
-  border-radius:5px;padding:.55rem .75rem;color:var(--cream);font-family:'Inter',sans-serif;
-  font-size:.88rem;outline:none;transition:border-color .2s}}
-input[type=text]:focus,input[type=number]:focus,textarea:focus{{border-color:var(--gold)}}
-textarea{{resize:vertical;min-height:80px}}
-input[type=range]{{width:100%;accent-color:var(--gold);cursor:pointer;height:4px}}
-/* Buttons */
-.btn{{display:inline-flex;align-items:center;gap:.4rem;padding:.55rem 1.1rem;
-  border-radius:5px;border:none;cursor:pointer;font-size:.82rem;font-family:'Inter',sans-serif;
-  font-weight:500;transition:all .18s;white-space:nowrap}}
+  width:100%;background:rgba(15,5,2,.7);border:1px solid var(--border);border-radius:5px;
+  padding:.5rem .75rem;color:var(--cream);font-family:'Inter',sans-serif;font-size:.88rem;outline:none;transition:border-color .2s}}
+input:focus,textarea:focus,select:focus{{border-color:var(--gold)}}
+textarea{{resize:vertical;min-height:72px}}
+input[type=range]{{width:100%;accent-color:var(--gold);cursor:pointer;margin:.15rem 0}}
+.btn{{display:inline-flex;align-items:center;gap:.4rem;padding:.5rem 1rem;border-radius:5px;
+  border:none;cursor:pointer;font-size:.82rem;font-family:'Inter',sans-serif;font-weight:500;transition:all .18s;white-space:nowrap}}
 .btn-gold{{background:linear-gradient(135deg,#d4a017,#a07810);color:#1a0c04}}
-.btn-gold:hover{{background:linear-gradient(135deg,#e8b520,#b88c14);transform:translateY(-1px)}}
-.btn-red{{background:linear-gradient(135deg,#cc1b1b,#8b0000);color:#fff}}
-.btn-red:hover{{opacity:.88}}
-.btn-ghost{{background:none;border:1px solid var(--border);color:var(--cream2)}}
-.btn-ghost:hover{{border-color:var(--gold);color:var(--gold)}}
-.btn-sm{{padding:.35rem .75rem;font-size:.75rem}}
-.btn-green{{background:linear-gradient(135deg,#2e7d32,#1b5e20);color:#fff}}
-/* Table */
+.btn-gold:hover{{filter:brightness(1.12);transform:translateY(-1px)}}
+.btn-red{{background:rgba(204,27,27,.8);color:#fff}}.btn-red:hover{{background:rgba(204,27,27,1)}}
+.btn-ghost{{background:none;border:1px solid var(--border);color:var(--cream2)}}.btn-ghost:hover{{border-color:var(--gold);color:var(--gold)}}
+.btn-green{{background:rgba(46,125,50,.85);color:#fff}}.btn-green:hover{{background:rgba(46,125,50,1)}}
+.btn-sm{{padding:.3rem .7rem;font-size:.75rem}}
 .tbl-wrap{{overflow-x:auto;border-radius:var(--r);border:1px solid var(--border)}}
 table{{width:100%;border-collapse:collapse}}
-th{{padding:.65rem .85rem;text-align:left;font-size:.72rem;text-transform:uppercase;
-  letter-spacing:.06em;color:rgba(212,184,150,.5);background:rgba(26,12,4,.6);
-  border-bottom:1px solid var(--border);white-space:nowrap}}
-td{{padding:.65rem .85rem;border-bottom:1px solid rgba(92,45,15,.25);font-size:.85rem;
-  vertical-align:middle}}
+th{{padding:.6rem .85rem;text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;
+  color:rgba(212,184,150,.45);background:rgba(26,12,4,.5);border-bottom:1px solid var(--border);white-space:nowrap}}
+td{{padding:.6rem .85rem;border-bottom:1px solid rgba(92,45,15,.2);font-size:.85rem;vertical-align:middle}}
 tr:last-child td{{border-bottom:none}}
-tr:hover td{{background:rgba(212,160,23,.04)}}
-/* Badges */
-.badge{{display:inline-block;padding:.2rem .55rem;border-radius:12px;
-  font-size:.68rem;font-weight:600;letter-spacing:.04em}}
+tr:hover td{{background:rgba(212,160,23,.03)}}
+.badge{{display:inline-block;padding:.18rem .5rem;border-radius:12px;font-size:.68rem;font-weight:600;letter-spacing:.04em}}
 .badge-gold{{background:rgba(212,160,23,.15);color:var(--gold);border:1px solid rgba(212,160,23,.3)}}
 .badge-gray{{background:rgba(92,45,15,.25);color:rgba(212,184,150,.5);border:1px solid var(--border)}}
 .badge-green{{background:rgba(76,175,80,.15);color:#66bb6a;border:1px solid rgba(76,175,80,.3)}}
-/* Misc */
 .search-row{{display:flex;gap:.75rem;margin-bottom:1rem;align-items:center;flex-wrap:wrap}}
-.search-row input{{flex:1;min-width:180px}}
-.msg{{padding:.65rem 1rem;border-radius:5px;font-size:.82rem;margin-bottom:.75rem;display:none}}
-.msg-ok{{background:rgba(76,175,80,.12);border:1px solid rgba(76,175,80,.3);color:#81c784}}
-.msg-err{{background:rgba(204,27,27,.12);border:1px solid rgba(204,27,27,.3);color:#ef9a9a}}
-.sep{{height:1px;background:var(--border);margin:1.25rem 0}}
-.range-row{{display:flex;align-items:center;gap:.75rem}}
-.range-row span{{min-width:3rem;text-align:right;color:var(--gold);font-size:.82rem}}
-.pill-toggle{{display:inline-flex;border-radius:20px;overflow:hidden;border:1px solid var(--border)}}
-.pill-toggle button{{padding:.3rem .8rem;border:none;background:none;cursor:pointer;
-  font-size:.75rem;color:var(--cream2);transition:all .15s}}
-.pill-toggle button.on{{background:var(--gold);color:#1a0c04;font-weight:600}}
+.search-row input{{flex:1;min-width:160px}}
+.range-row{{display:flex;align-items:center;gap:.75rem;margin:.2rem 0}}
+.range-row input{{flex:1}}
+.range-row span{{min-width:3.2rem;text-align:right;color:var(--gold);font-size:.82rem;font-variant-numeric:tabular-nums}}
+/* Toast notifications */
+#toast-container{{position:fixed;bottom:1.5rem;right:1.5rem;display:flex;flex-direction:column;gap:.5rem;z-index:9999}}
+.toast{{padding:.75rem 1.25rem;border-radius:6px;font-size:.85rem;font-family:'Inter',sans-serif;
+  display:flex;align-items:center;gap:.6rem;box-shadow:0 4px 20px rgba(0,0,0,.4);
+  animation:slideIn .25s ease;max-width:320px}}
+.toast-ok{{background:#1b4332;border:1px solid rgba(76,175,80,.4);color:#81c784}}
+.toast-err{{background:#3b0a0a;border:1px solid rgba(204,27,27,.4);color:#ef9a9a}}
+@keyframes slideIn{{from{{opacity:0;transform:translateX(1rem)}}to{{opacity:1;transform:none}}}}
 </style>
 </head>
 <body>
+<div id="toast-container"></div>
 <div class="shell">
-
-<!-- ── Sidebar ── -->
 <aside class="sidebar">
   <div class="logo">
     <h1>⚙ AiStalin Admin</h1>
-    <p>{admin_email}</p>
+    <p title="{admin_email}">{admin_email}</p>
   </div>
   <button class="nav-item active" onclick="show('dash',this)"><i class="fa fa-chart-bar"></i>Dashboard</button>
   <button class="nav-item" onclick="show('users',this)"><i class="fa fa-users"></i>მომხმარებლები</button>
   <button class="nav-item" onclick="show('quotes',this)"><i class="fa fa-quote-left"></i>Daily Quotes</button>
   <button class="nav-item" onclick="show('settings',this)"><i class="fa fa-sliders"></i>პარამეტრები</button>
-  <div class="sidebar-foot">
-    <a href="https://aistalin.io" style="color:inherit;text-decoration:none;">← aistalin.io</a>
-  </div>
+  <div class="sidebar-foot"><a href="https://aistalin.io" style="color:inherit;text-decoration:none;">← aistalin.io</a></div>
 </aside>
-
-<!-- ── Main ── -->
 <main class="main">
 
 <!-- DASHBOARD -->
 <div id="sec-dash" class="section active">
-  <div class="section-title">Dashboard</div>
+  <div class="page-title">Dashboard</div>
   <div class="grid-4" id="stats-grid">
     <div class="stat-card"><div class="stat-num" id="s-users">—</div><div class="stat-lbl">სულ მომხმარებელი</div></div>
     <div class="stat-card"><div class="stat-num" id="s-premium">—</div><div class="stat-lbl">Premium</div></div>
     <div class="stat-card"><div class="stat-num" id="s-chats">—</div><div class="stat-lbl">ჩათი დღეს</div></div>
-    <div class="stat-card"><div class="stat-num" id="s-rev">—</div><div class="stat-lbl">შემოსავალი ($)</div></div>
+    <div class="stat-card"><div class="stat-num" id="s-rev">—</div><div class="stat-lbl">Revenue ($)</div></div>
   </div>
   <div class="grid-2">
-    <div class="card">
-      <div class="card-title">ახალი მომხმარებლები დღეს</div>
-      <div id="s-today" style="font-size:2.5rem;font-family:'Playfair Display',serif;color:var(--gold)">—</div>
-    </div>
-    <div class="card">
-      <div class="card-title">შემოსავალი ამ თვეში</div>
-      <div id="s-month" style="font-size:2.5rem;font-family:'Playfair Display',serif;color:var(--gold)">—</div>
-    </div>
+    <div class="card"><div class="card-title">ახ. მომხმარებელი დღეს</div>
+      <div id="s-today" style="font-size:2.5rem;font-family:'Playfair Display',serif;color:var(--gold)">—</div></div>
+    <div class="card"><div class="card-title">შემოსავალი ამ თვეში</div>
+      <div id="s-month" style="font-size:2.5rem;font-family:'Playfair Display',serif;color:var(--gold)">—</div></div>
   </div>
 </div>
 
 <!-- USERS -->
 <div id="sec-users" class="section">
-  <div class="section-title">მომხმარებლები</div>
+  <div class="page-title">მომხმარებლები</div>
   <div class="search-row">
     <input id="u-search" type="text" placeholder="ელ-ფოსტით ძიება..." oninput="debounceUserSearch()">
-    <button class="btn btn-ghost" onclick="loadUsers()"><i class="fa fa-refresh"></i> განახლება</button>
+    <button class="btn btn-ghost" onclick="loadUsers()"><i class="fa fa-refresh"></i></button>
   </div>
-  <div id="u-msg" class="msg"></div>
   <div class="tbl-wrap">
     <table>
-      <thead><tr>
-        <th>ID</th><th>ელ-ფოსტა</th>
-        <th class="hide-mobile">რეგისტრაცია</th>
-        <th class="hide-mobile">IP</th>
-        <th>სტატუსი</th><th>მოქმედება</th>
-      </tr></thead>
+      <thead><tr><th>ID</th><th>ელ-ფოსტა</th><th class="hide-m">რეგ. თარიღი</th><th class="hide-m">IP</th><th>სტატუსი</th><th>მოქმედება</th></tr></thead>
       <tbody id="u-tbody"><tr><td colspan="6" style="text-align:center;padding:2rem;opacity:.4">იტვირთება...</td></tr></tbody>
     </table>
   </div>
-  <div id="u-pagination" style="margin-top:.75rem;display:flex;gap:.5rem;flex-wrap:wrap"></div>
+  <div id="u-pagination" style="margin-top:.75rem;display:flex;gap:.4rem;flex-wrap:wrap"></div>
 </div>
 
 <!-- QUOTES -->
 <div id="sec-quotes" class="section">
-  <div class="section-title">Daily Stalin Quotes</div>
-  <div id="q-msg" class="msg"></div>
+  <div class="page-title">Daily Quotes</div>
   <div class="card">
-    <div class="card-title">ახალი ციტატის დამატება</div>
+    <div class="card-title"><i class="fa fa-plus-circle"></i> ახალი ციტატა</div>
     <div style="margin-bottom:.75rem">
       <label>ტექსტი (ქართული) *</label>
       <textarea id="q-ka" placeholder="ქართული ტექსტი..."></textarea>
     </div>
     <div class="grid-2" style="margin-bottom:.75rem">
-      <div><label>ტექსტი (English)</label>
-      <textarea id="q-en" placeholder="English text..." style="min-height:60px"></textarea></div>
-      <div><label>ტექსტი (Русский)</label>
-      <textarea id="q-ru" placeholder="Русский текст..." style="min-height:60px"></textarea></div>
+      <div><label>English</label><textarea id="q-en" placeholder="English text..." style="min-height:60px"></textarea></div>
+      <div><label>Русский</label><textarea id="q-ru" placeholder="Русский текст..." style="min-height:60px"></textarea></div>
     </div>
-    <div style="margin-bottom:1rem">
-      <label>წყარო (მაგ: ტომი 11)</label>
-      <input id="q-src" type="text" placeholder="ტომი X">
+    <div class="grid-2" style="margin-bottom:1rem">
+      <div><label>წყარო (მაგ: ტომი 11, გვ. 34)</label><input id="q-src" type="text" placeholder="ტომი X"></div>
+      <div style="display:flex;align-items:flex-end;padding-bottom:.1rem">
+        <label style="margin:0;margin-right:.75rem">სტატუსი:</label>
+        <label style="display:flex;align-items:center;gap:.4rem;cursor:pointer;opacity:1">
+          <input type="checkbox" id="q-active" checked style="accent-color:var(--gold);width:15px;height:15px">
+          <span>აქტიური</span>
+        </label>
+      </div>
     </div>
     <button class="btn btn-gold" onclick="addQuote()"><i class="fa fa-plus"></i> დამატება</button>
   </div>
   <div class="tbl-wrap">
     <table>
-      <thead><tr><th>ID</th><th>ტექსტი (KA)</th><th class="hide-mobile">წყარო</th><th>სტატუსი</th><th>მოქმედება</th></tr></thead>
-      <tbody id="q-tbody"><tr><td colspan="5" style="text-align:center;padding:2rem;opacity:.4">იტვირთება...</td></tr></tbody>
+      <thead><tr><th>#</th><th>ციტატა (KA)</th><th class="hide-m">წყარო</th><th>EN</th><th>RU</th><th>სტატ.</th><th>მოქმ.</th></tr></thead>
+      <tbody id="q-tbody"><tr><td colspan="7" style="text-align:center;padding:2rem;opacity:.4">იტვირთება...</td></tr></tbody>
     </table>
   </div>
 </div>
 
 <!-- SETTINGS -->
 <div id="sec-settings" class="section">
-  <div class="section-title">პარამეტრები</div>
-  <div id="st-msg" class="msg"></div>
-  <div class="grid-2">
-    <!-- Audio -->
-    <div class="card">
-      <div class="card-title">🎵 Audio</div>
-      <div style="margin-bottom:1rem">
-        <label>Ambient Volume (default)</label>
-        <div class="range-row">
-          <input type="range" min="0" max="100" id="s-amb" oninput="document.getElementById('s-amb-v').textContent=this.value+'%'">
-          <span id="s-amb-v">13%</span>
-        </div>
+  <div class="page-title">პარამეტრები</div>
+  <!-- Audio Controls -->
+  <div class="card">
+    <div class="card-title"><i class="fa fa-music"></i> Audio — ხმის კონტროლი</div>
+    <div class="grid-2">
+      <div>
+        <label>🎵 Background Music (bg-music.mp3)</label>
+        <div class="range-row"><input type="range" min="0" max="100" id="s-bgmusic" oninput="rv('s-bgmusic-v',this.value,'%')"><span id="s-bgmusic-v">13%</span></div>
+        <label style="margin-top:.85rem">💡 Lamp Switch (lamp-switch.mp3)</label>
+        <div class="range-row"><input type="range" min="0" max="100" id="s-lamp" oninput="rv('s-lamp-v',this.value,'%')"><span id="s-lamp-v">55%</span></div>
       </div>
       <div>
-        <label>Background Music Volume</label>
-        <div class="range-row">
-          <input type="range" min="0" max="100" id="s-mus" oninput="document.getElementById('s-mus-v').textContent=this.value+'%'">
-          <span id="s-mus-v">13%</span>
-        </div>
+        <label>📖 Book Rustle (old_book_rustle.mp3)</label>
+        <div class="range-row"><input type="range" min="0" max="100" id="s-book" oninput="rv('s-book-v',this.value,'%')"><span id="s-book-v">30%</span></div>
+        <label style="margin-top:.85rem">🔔 Notification (ring.mp3)</label>
+        <div class="range-row"><input type="range" min="0" max="100" id="s-ring" oninput="rv('s-ring-v',this.value,'%')"><span id="s-ring-v">39%</span></div>
       </div>
     </div>
-    <!-- Chat UI -->
-    <div class="card">
-      <div class="card-title">💬 Chat UI</div>
-      <div style="margin-bottom:1rem">
+    <div style="margin-top:.85rem;max-width:360px">
+      <label>🔕 Music On/Off SFX (music_on_off.mp3)</label>
+      <div class="range-row"><input type="range" min="0" max="100" id="s-mutesfx" oninput="rv('s-mutesfx-v',this.value,'%')"><span id="s-mutesfx-v">50%</span></div>
+    </div>
+  </div>
+  <!-- Chat UI -->
+  <div class="card">
+    <div class="card-title"><i class="fa fa-comments"></i> Chat UI</div>
+    <div class="grid-2">
+      <div>
         <label>Chat Height (px)</label>
-        <div class="range-row">
-          <input type="range" min="200" max="800" step="20" id="s-ch" oninput="document.getElementById('s-ch-v').textContent=this.value+'px'">
-          <span id="s-ch-v">400px</span>
-        </div>
+        <div class="range-row"><input type="range" min="200" max="800" step="20" id="s-ch" oninput="rv('s-ch-v',this.value,'px')"><span id="s-ch-v">400px</span></div>
       </div>
       <div>
-        <label>Scroll Speed (px per wheel tick)</label>
-        <div class="range-row">
-          <input type="range" min="10" max="100" step="5" id="s-sc" oninput="document.getElementById('s-sc-v').textContent=this.value+'px'">
-          <span id="s-sc-v">38px</span>
-        </div>
+        <label>Scroll Speed (px / wheel tick)</label>
+        <div class="range-row"><input type="range" min="10" max="100" step="5" id="s-sc" oninput="rv('s-sc-v',this.value,'px')"><span id="s-sc-v">38px</span></div>
       </div>
     </div>
   </div>
+  <!-- Language -->
   <div class="card">
-    <div class="card-title">🌐 ენა / Multilingual</div>
+    <div class="card-title"><i class="fa fa-globe"></i> ენა / Multilingual</div>
     <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
       <label style="margin:0">Default UI Language:</label>
-      <select id="s-lang" style="width:auto">
-        <option value="ka">ქართული (KA)</option>
-        <option value="en">English (EN)</option>
-        <option value="ru">Русский (RU)</option>
-      </select>
-      <span style="font-size:.75rem;opacity:.5">Russian RAG: not yet loaded</span>
+      <select id="s-lang" style="width:auto"><option value="ka">ქართული (KA)</option><option value="en">English (EN)</option><option value="ru">Русский (RU) — pending</option></select>
+      <span style="font-size:.75rem;opacity:.45;font-style:italic">Russian RAG: not yet loaded</span>
     </div>
   </div>
-  <button class="btn btn-gold" onclick="saveSettings()"><i class="fa fa-save"></i> შენახვა</button>
+  <button class="btn btn-gold" onclick="saveSettings()" style="min-width:130px"><i class="fa fa-save"></i> შენახვა</button>
 </div>
 
 </main></div>
 
 <script>
-const API='{api}';
-const HEADERS={{'Content-Type':'application/json','Authorization':'Bearer '+localStorage.getItem('aistalin_jwt')}};
+// ── JWT: embedded by server on dashboard load ──────────────────────────────
+(function initAuth() {{
+  // JWT embedded directly by FastAPI when serving this page
+  var embedded = '{jwt_token}';
+  if (embedded && embedded !== 'None' && embedded.length > 10) {{
+    sessionStorage.setItem('admin_jwt', embedded);
+  }}
+  // Also check URL param fallback
+  var params = new URLSearchParams(window.location.search);
+  var urlJwt = params.get('_jwt');
+  if (urlJwt) {{
+    sessionStorage.setItem('admin_jwt', urlJwt);
+    history.replaceState(null, '', window.location.pathname +
+      (params.get('token') ? '?token=' + params.get('token') : ''));
+  }}
+}})();
 
-// ── Nav ──────────────────────────────────────────────────────────
-function show(sec,btn){{
-  document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));
-  document.querySelectorAll('.nav-item').forEach(b=>b.classList.remove('active'));
+const API = '{api}';
+function getHeaders() {{
+  var jwt = sessionStorage.getItem('admin_jwt');
+  return {{'Content-Type':'application/json','Authorization':'Bearer '+(jwt||'')}};
+}}
+
+// ── Toast ──────────────────────────────────────────────────────────────────
+function toast(msg, ok) {{
+  var c = document.getElementById('toast-container');
+  var t = document.createElement('div');
+  t.className = 'toast ' + (ok ? 'toast-ok' : 'toast-err');
+  t.innerHTML = '<i class="fa ' + (ok?'fa-check-circle':'fa-exclamation-circle') + '"></i> ' + msg;
+  c.appendChild(t);
+  setTimeout(function(){{ t.style.opacity='0'; t.style.transition='opacity .3s'; setTimeout(function(){{t.remove()}},350); }}, 3500);
+}}
+
+// ── Nav ────────────────────────────────────────────────────────────────────
+function show(sec, btn) {{
+  document.querySelectorAll('.section').forEach(function(s){{s.classList.remove('active')}});
+  document.querySelectorAll('.nav-item').forEach(function(b){{b.classList.remove('active')}});
   document.getElementById('sec-'+sec).classList.add('active');
   btn.classList.add('active');
-  if(sec==='dash')loadStats();
-  if(sec==='users')loadUsers();
-  if(sec==='quotes')loadQuotes();
-  if(sec==='settings')loadSettings();
+  if(sec==='dash') loadStats();
+  if(sec==='users') loadUsers();
+  if(sec==='quotes') loadQuotes();
+  if(sec==='settings') loadSettings();
 }}
 
-// ── Stats ─────────────────────────────────────────────────────────
-async function loadStats(){{
-  try{{
-    const r=await fetch(API+'/admin/stats',{{headers:HEADERS}});
-    const d=await r.json();
-    document.getElementById('s-users').textContent=d.users_total;
-    document.getElementById('s-premium').textContent=d.users_premium;
-    document.getElementById('s-chats').textContent=d.chats_today;
-    document.getElementById('s-rev').textContent='$'+parseFloat(d.revenue_total).toFixed(2);
-    document.getElementById('s-today').textContent=d.users_today;
-    document.getElementById('s-month').textContent='$'+parseFloat(d.revenue_month).toFixed(2);
-  }}catch(e){{console.error(e)}}
+// ── Stats ──────────────────────────────────────────────────────────────────
+async function loadStats() {{
+  try {{
+    var r = await fetch(API+'/admin/stats', {{headers:getHeaders()}});
+    if(!r.ok) {{ toast('Stats: '+r.status, false); return; }}
+    var d = await r.json();
+    document.getElementById('s-users').textContent = d.users_total;
+    document.getElementById('s-premium').textContent = d.users_premium;
+    document.getElementById('s-chats').textContent = d.chats_today;
+    document.getElementById('s-rev').textContent = '$'+parseFloat(d.revenue_total||0).toFixed(2);
+    document.getElementById('s-today').textContent = d.users_today;
+    document.getElementById('s-month').textContent = '$'+parseFloat(d.revenue_month||0).toFixed(2);
+  }} catch(e) {{ toast('Stats load failed: '+e.message, false); }}
 }}
 
-// ── Users ─────────────────────────────────────────────────────────
-let _uPage=1,_uSearch='',_uTimer=null;
-function debounceUserSearch(){{
+// ── Users ──────────────────────────────────────────────────────────────────
+var _uPage=1, _uSearch='', _uTimer=null;
+function debounceUserSearch() {{
   clearTimeout(_uTimer);
-  _uTimer=setTimeout(()=>{{_uPage=1;_uSearch=document.getElementById('u-search').value.trim();loadUsers();}},350);
+  _uTimer = setTimeout(function(){{ _uPage=1; _uSearch=document.getElementById('u-search').value.trim(); loadUsers(); }}, 350);
 }}
-async function loadUsers(){{
-  const tbody=document.getElementById('u-tbody');
-  tbody.innerHTML='<tr><td colspan="6" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
-  try{{
-    const r=await fetch(API+`/admin/users?page=${{_uPage}}&search=${{encodeURIComponent(_uSearch)}}`,{{headers:HEADERS}});
-    const d=await r.json();
-    if(!d.users||!d.users.length){{tbody.innerHTML='<tr><td colspan="6" style="text-align:center;padding:1.5rem;opacity:.4">მომხმარებლები არ მოიძებნა</td></tr>';return;}}
-    tbody.innerHTML=d.users.map(u=>`
-      <tr>
-        <td style="opacity:.5">${{u.id}}</td>
-        <td style="font-family:'Playfair Display',serif">${{u.email}}</td>
-        <td class="hide-mobile" style="opacity:.5">${{u.created_at}}</td>
-        <td class="hide-mobile" style="opacity:.4;font-size:.75rem">${{u.ip||'—'}}</td>
-        <td>${{u.is_premium
-          ?'<span class="badge badge-gold">★ Premium</span>'
-          :'<span class="badge badge-gray">Free</span>'}}</td>
-        <td>
-          ${{u.is_premium
-            ?`<button class="btn btn-sm btn-red" onclick="togglePremium(${{u.id}},false)">Revoke</button>`
-            :`<button class="btn btn-sm btn-green" onclick="togglePremium(${{u.id}},true)">Grant</button>`}}
-        </td>
-      </tr>`).join('');
-    // Pagination
-    const pages=Math.ceil(d.total/d.per_page);
-    const pg=document.getElementById('u-pagination');
-    pg.innerHTML='';
-    for(let i=1;i<=Math.min(pages,10);i++){{
-      const b=document.createElement('button');
+async function loadUsers() {{
+  var tb = document.getElementById('u-tbody');
+  tb.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
+  try {{
+    var r = await fetch(API+'/admin/users?page='+_uPage+'&search='+encodeURIComponent(_uSearch), {{headers:getHeaders()}});
+    if(!r.ok) {{ toast('Users: '+r.status, false); return; }}
+    var d = await r.json();
+    if(!d.users||!d.users.length) {{ tb.innerHTML='<tr><td colspan="6" style="text-align:center;padding:1.5rem;opacity:.4">მომხმარებლები არ მოიძებნა</td></tr>'; return; }}
+    tb.innerHTML = d.users.map(function(u){{ return '<tr><td style="opacity:.5">'+u.id+'</td><td style="font-family:Playfair Display,serif">'+u.email+'</td><td class="hide-m" style="opacity:.5">'+u.created_at+'</td><td class="hide-m" style="opacity:.35;font-size:.75rem">'+(u.ip||'—')+'</td><td>'+(u.is_premium?'<span class="badge badge-gold">★ Premium</span>':'<span class="badge badge-gray">Free</span>')+'</td><td>'+(u.is_premium?'<button class="btn btn-sm btn-red" onclick="togglePremium('+u.id+',false)">Revoke</button>':'<button class="btn btn-sm btn-green" onclick="togglePremium('+u.id+',true)">Grant 30d</button>')+'</td></tr>'; }}).join('');
+    var pages = Math.ceil(d.total/d.per_page);
+    var pg = document.getElementById('u-pagination');
+    pg.innerHTML = '';
+    for(var i=1;i<=Math.min(pages,10);i++) {{
+      var b=document.createElement('button');
       b.className='btn btn-ghost btn-sm'+(i===_uPage?' btn-gold':'');
-      b.textContent=i;b.onclick=(()=>{{const p=i;return()=>{{_uPage=p;loadUsers();}}}})();
+      b.textContent=i;
+      (function(p){{b.onclick=function(){{_uPage=p;loadUsers();}};}})(i);
       pg.appendChild(b);
     }}
-  }}catch(e){{tbody.innerHTML='<tr><td colspan="6" style="color:#ef9a9a;text-align:center;padding:1.5rem">შეცდომა: '+e.message+'</td></tr>';}}
+  }} catch(e) {{ toast('Error: '+e.message, false); }}
 }}
-async function togglePremium(uid,grant){{
-  const el=document.getElementById('u-msg');
-  try{{
-    await fetch(API+'/admin/users/'+uid+'/premium',{{method:'POST',headers:HEADERS,body:JSON.stringify({{is_premium:grant,days:30}})}});
-    showMsg('u-msg','✓ '+(grant?'Premium მიენიჭა':'Premium გაუქმდა'),true);
+async function togglePremium(uid, grant) {{
+  try {{
+    var r = await fetch(API+'/admin/users/'+uid+'/premium', {{method:'POST',headers:getHeaders(),body:JSON.stringify({{is_premium:grant,days:30}})}});
+    if(!r.ok) {{ toast('Toggle failed: '+r.status, false); return; }}
+    toast(grant ? '✓ Premium მიენიჭა (30 დღე)' : '✓ Premium გაუქმდა', true);
     loadUsers();
-  }}catch(e){{showMsg('u-msg','⚠ '+e.message,false);}}
+  }} catch(e) {{ toast('Error: '+e.message, false); }}
 }}
 
-// ── Quotes ────────────────────────────────────────────────────────
-async function loadQuotes(){{
-  const tbody=document.getElementById('q-tbody');
-  tbody.innerHTML='<tr><td colspan="5" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
-  try{{
-    const r=await fetch(API+'/admin/quotes',{{headers:HEADERS}});
-    const quotes=await r.json();
-    if(!quotes.length){{tbody.innerHTML='<tr><td colspan="5" style="text-align:center;opacity:.4;padding:1.5rem">ციტატები არ არის</td></tr>';return;}}
-    tbody.innerHTML=quotes.map(q=>`
-      <tr>
-        <td style="opacity:.5">${{q.id}}</td>
-        <td style="font-family:'Playfair Display',serif;font-size:.82rem;max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${{q.text_ka}}</td>
-        <td class="hide-mobile" style="opacity:.5">${{q.source||'—'}}</td>
-        <td>${{q.is_active?'<span class="badge badge-green">Active</span>':'<span class="badge badge-gray">Off</span>'}}</td>
-        <td style="display:flex;gap:.4rem;flex-wrap:wrap">
-          <button class="btn btn-sm btn-ghost" onclick="toggleQuote(${{q.id}},${{!q.is_active}},\`${{encodeURIComponent(q.text_ka)}}\`,\`${{encodeURIComponent(q.text_en||'')}}\`,\`${{encodeURIComponent(q.text_ru||'')}}\`,\`${{encodeURIComponent(q.source||'')}}\`)">${{q.is_active?'Off':'On'}}</button>
-          <button class="btn btn-sm btn-red" onclick="deleteQuote(${{q.id}})"><i class="fa fa-trash"></i></button>
-        </td>
-      </tr>`).join('');
-  }}catch(e){{tbody.innerHTML='<tr><td colspan="5" style="color:#ef9a9a;text-align:center;padding:1.5rem">შეცდომა</td></tr>';}}
+// ── Quotes ─────────────────────────────────────────────────────────────────
+var _editingQuoteId = null;
+async function loadQuotes() {{
+  var tb = document.getElementById('q-tbody');
+  tb.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
+  try {{
+    var r = await fetch(API+'/admin/quotes', {{headers:getHeaders()}});
+    if(!r.ok) {{ toast('Quotes: '+r.status, false); return; }}
+    var quotes = await r.json();
+    if(!quotes.length) {{ tb.innerHTML='<tr><td colspan="7" style="text-align:center;opacity:.4;padding:1.5rem">ციტატები არ არის. დაამატეთ ზემოდან.</td></tr>'; return; }}
+    tb.innerHTML = quotes.map(function(q) {{
+      var preview = (q.text_ka||'').substring(0,60)+(q.text_ka&&q.text_ka.length>60?'…':'');
+      return '<tr id="qrow-'+q.id+'">'
+        +'<td style="opacity:.5">'+q.id+'</td>'
+        +'<td style="font-family:Playfair Display,serif;font-size:.82rem;max-width:260px" title="'+q.text_ka.replace(/"/g,"&quot;")+'">'+preview+'</td>'
+        +'<td class="hide-m" style="opacity:.5;font-size:.8rem">'+(q.source||'—')+'</td>'
+        +'<td style="font-size:.75rem;opacity:.65">'+(q.text_en?'✓':'—')+'</td>'
+        +'<td style="font-size:.75rem;opacity:.65">'+(q.text_ru?'✓':'—')+'</td>'
+        +'<td>'+(q.is_active?'<span class="badge badge-green">●</span>':'<span class="badge badge-gray">○</span>')+'</td>'
+        +'<td style="display:flex;gap:.3rem;flex-wrap:wrap">'
+        +'<button class="btn btn-sm btn-ghost" onclick="editQuote('+q.id+')"><i class="fa fa-pen"></i></button>'
+        +'<button class="btn btn-sm '+(q.is_active?'btn-ghost':'btn-green')+'" onclick="toggleQuoteActive('+q.id+','+(q.is_active?'false':'true')+')" title="'+(q.is_active?'Off':'On')+'">'+(q.is_active?'Off':'On')+'</button>'
+        +'<button class="btn btn-sm btn-red" onclick="deleteQuote('+q.id+')"><i class="fa fa-trash"></i></button>'
+        +'</td></tr>';
+    }}).join('');
+  }} catch(e) {{ toast('Error: '+e.message, false); }}
 }}
-async function addQuote(){{
-  const ka=document.getElementById('q-ka').value.trim();
-  if(!ka){{showMsg('q-msg','⚠ ქართული ტექსტი სავალდებულოა',false);return;}}
-  try{{
-    await fetch(API+'/admin/quotes',{{method:'POST',headers:HEADERS,body:JSON.stringify({{
-      text_ka:ka,text_en:document.getElementById('q-en').value.trim()||null,
-      text_ru:document.getElementById('q-ru').value.trim()||null,
-      source:document.getElementById('q-src').value.trim()||null,is_active:true
-    }})}});
-    document.getElementById('q-ka').value='';document.getElementById('q-en').value='';
-    document.getElementById('q-ru').value='';document.getElementById('q-src').value='';
-    showMsg('q-msg','✓ ციტატა დაემატა',true);loadQuotes();
-  }}catch(e){{showMsg('q-msg','⚠ '+e.message,false);}}
+function editQuote(id) {{
+  fetch(API+'/admin/quotes', {{headers:getHeaders()}}).then(function(r){{return r.json();}}).then(function(quotes){{
+    var q = quotes.find(function(x){{return x.id===id;}});
+    if(!q) return;
+    document.getElementById('q-ka').value = q.text_ka||'';
+    document.getElementById('q-en').value = q.text_en||'';
+    document.getElementById('q-ru').value = q.text_ru||'';
+    document.getElementById('q-src').value = q.source||'';
+    document.getElementById('q-active').checked = q.is_active;
+    _editingQuoteId = id;
+    var btn = document.querySelector('[onclick="addQuote()"]');
+    if(btn) {{ btn.innerHTML='<i class="fa fa-save"></i> განახლება #'+id; btn.className='btn btn-green'; }}
+    document.getElementById('q-ka').focus();
+    document.getElementById('q-ka').scrollIntoView({{behavior:'smooth',block:'center'}});
+  }});
 }}
-async function deleteQuote(id){{
-  if(!confirm('წაიშლება. გაგრძელება?'))return;
-  try{{await fetch(API+'/admin/quotes/'+id,{{method:'DELETE',headers:HEADERS}});showMsg('q-msg','✓ წაიშალა',true);loadQuotes();}}catch(e){{showMsg('q-msg','⚠ '+e.message,false);}}
-}}
-async function toggleQuote(id,active,ka,en,ru,src){{
-  try{{
-    await fetch(API+'/admin/quotes/'+id,{{method:'PUT',headers:HEADERS,body:JSON.stringify({{
-      text_ka:decodeURIComponent(ka),text_en:decodeURIComponent(en)||null,
-      text_ru:decodeURIComponent(ru)||null,source:decodeURIComponent(src)||null,is_active:active
-    }})}});
+async function addQuote() {{
+  var ka = document.getElementById('q-ka').value.trim();
+  if(!ka) {{ toast('⚠ ქართული ტექსტი სავალდებულოა', false); return; }}
+  var body = {{
+    text_ka: ka,
+    text_en: document.getElementById('q-en').value.trim()||null,
+    text_ru: document.getElementById('q-ru').value.trim()||null,
+    source:  document.getElementById('q-src').value.trim()||null,
+    is_active: document.getElementById('q-active').checked
+  }};
+  try {{
+    var url = _editingQuoteId ? API+'/admin/quotes/'+_editingQuoteId : API+'/admin/quotes';
+    var method = _editingQuoteId ? 'PUT' : 'POST';
+    var r = await fetch(url, {{method:method, headers:getHeaders(), body:JSON.stringify(body)}});
+    if(!r.ok) {{ toast('შენახვა ვერ მოხერხდა: '+r.status, false); return; }}
+    toast(_editingQuoteId ? '✓ ციტატა განახლდა' : '✓ ციტატა დაემატა', true);
+    // Reset form
+    ['q-ka','q-en','q-ru','q-src'].forEach(function(id){{document.getElementById(id).value='';}});
+    document.getElementById('q-active').checked=true;
+    _editingQuoteId=null;
+    var btn=document.querySelector('[onclick="addQuote()"]');
+    if(btn){{btn.innerHTML='<i class="fa fa-plus"></i> დამატება';btn.className='btn btn-gold';}}
     loadQuotes();
-  }}catch(e){{showMsg('q-msg','⚠ '+e.message,false);}}
+  }} catch(e) {{ toast('Error: '+e.message, false); }}
+}}
+async function toggleQuoteActive(id, active) {{
+  try {{
+    var r = await fetch(API+'/admin/quotes', {{headers:getHeaders()}});
+    var quotes = await r.json();
+    var q = quotes.find(function(x){{return x.id===id;}});
+    if(!q) return;
+    var r2 = await fetch(API+'/admin/quotes/'+id, {{method:'PUT',headers:getHeaders(),
+      body:JSON.stringify({{text_ka:q.text_ka,text_en:q.text_en,text_ru:q.text_ru,source:q.source,is_active:active}})}});
+    if(!r2.ok) {{ toast('Error: '+r2.status, false); return; }}
+    toast(active ? '✓ ციტატა გააქტიურდა' : '✓ ციტატა გამოირთო', true);
+    loadQuotes();
+  }} catch(e) {{ toast('Error: '+e.message, false); }}
+}}
+async function deleteQuote(id) {{
+  if(!confirm('ციტატა #'+id+' წაიშლება. დარწმუნებული ხართ?')) return;
+  try {{
+    var r = await fetch(API+'/admin/quotes/'+id, {{method:'DELETE',headers:getHeaders()}});
+    if(!r.ok) {{ toast('წაშლა ვერ მოხერხდა: '+r.status, false); return; }}
+    toast('✓ ციტატა წაიშალა', true);
+    loadQuotes();
+  }} catch(e) {{ toast('Error: '+e.message, false); }}
 }}
 
-// ── Settings ──────────────────────────────────────────────────────
-async function loadSettings(){{
-  try{{
-    const r=await fetch(API+'/admin/settings',{{headers:HEADERS}});
-    const s=await r.json();
-    const set=(id,key,suffix='')=>{{
-      const el=document.getElementById(id);
-      if(el&&s[key]!==undefined){{el.value=s[key];const lbl=document.getElementById(id+'-v');if(lbl)lbl.textContent=s[key]+suffix;}}
-    }};
-    set('s-amb','ambient_volume','%');set('s-mus','music_volume','%');
-    set('s-ch','chat_height_px','px');set('s-sc','scroll_speed_px','px');
-    const lang=document.getElementById('s-lang');if(lang&&s.ui_lang_default)lang.value=s.ui_lang_default;
-  }}catch(e){{showMsg('st-msg','⚠ Settings load failed',false);}}
+// ── Settings ────────────────────────────────────────────────────────────────
+function rv(id, val, suffix) {{
+  var el = document.getElementById(id);
+  if(el) el.textContent = val + suffix;
 }}
-async function saveSettings(){{
-  const pairs=[
-    ['ambient_volume',document.getElementById('s-amb').value],
-    ['music_volume',document.getElementById('s-mus').value],
-    ['chat_height_px',document.getElementById('s-ch').value],
-    ['scroll_speed_px',document.getElementById('s-sc').value],
-    ['ui_lang_default',document.getElementById('s-lang').value],
+async function loadSettings() {{
+  try {{
+    var r = await fetch(API+'/admin/settings', {{headers:getHeaders()}});
+    if(!r.ok) {{ toast('Settings load failed: '+r.status, false); return; }}
+    var s = await r.json();
+    function setSlider(id, key, suffix) {{
+      var el = document.getElementById(id);
+      var vEl = document.getElementById(id+'-v');
+      if(el && s[key]!==undefined) {{ el.value=s[key]; if(vEl) vEl.textContent=s[key]+suffix; }}
+    }}
+    setSlider('s-bgmusic','bg_music_volume','%');
+    setSlider('s-lamp',   'lamp_volume',    '%');
+    setSlider('s-book',   'book_volume',    '%');
+    setSlider('s-ring',   'ring_volume',    '%');
+    setSlider('s-mutesfx','mutesfx_volume', '%');
+    setSlider('s-ch',     'chat_height_px', 'px');
+    setSlider('s-sc',     'scroll_speed_px','px');
+    var lang = document.getElementById('s-lang');
+    if(lang && s.ui_lang_default) lang.value = s.ui_lang_default;
+  }} catch(e) {{ toast('Settings load failed: '+e.message, false); }}
+}}
+async function saveSettings() {{
+  var pairs = [
+    ['bg_music_volume',  document.getElementById('s-bgmusic').value],
+    ['lamp_volume',      document.getElementById('s-lamp').value],
+    ['book_volume',      document.getElementById('s-book').value],
+    ['ring_volume',      document.getElementById('s-ring').value],
+    ['mutesfx_volume',   document.getElementById('s-mutesfx').value],
+    ['chat_height_px',   document.getElementById('s-ch').value],
+    ['scroll_speed_px',  document.getElementById('s-sc').value],
+    ['ui_lang_default',  document.getElementById('s-lang').value],
   ];
-  try{{
-    await Promise.all(pairs.map(([k,v])=>fetch(API+'/admin/settings',{{method:'POST',headers:HEADERS,body:JSON.stringify({{key:k,value:v}})}})));
-    showMsg('st-msg','✓ შენახულია',true);
-  }}catch(e){{showMsg('st-msg','⚠ '+e.message,false);}}
+  try {{
+    var results = await Promise.all(pairs.map(function(p) {{
+      return fetch(API+'/admin/settings', {{
+        method:'POST', headers:getHeaders(),
+        body:JSON.stringify({{key:p[0], value:p[1]}})
+      }}).then(function(r){{return {{key:p[0],ok:r.ok,status:r.status}};}});
+    }}));
+    var failed = results.filter(function(r){{return !r.ok;}});
+    if(failed.length) {{
+      toast('⚠ '+failed.length+' პარამეტრი ვერ შეინახა: '+failed.map(function(f){{return f.key+' ('+f.status+')';}}).join(', '), false);
+    }} else {{
+      toast('✓ ყველა პარამეტრი შენახულია!', true);
+    }}
+  }} catch(e) {{ toast('შენახვა ვერ მოხერხდა: '+e.message, false); }}
 }}
 
-// ── Util ──────────────────────────────────────────────────────────
-function showMsg(id,text,ok){{
-  const el=document.getElementById(id);if(!el)return;
-  el.textContent=text;el.className='msg '+(ok?'msg-ok':'msg-err');el.style.display='block';
-  setTimeout(()=>{{el.style.display='none';}},4000);
-}}
-
-// ── Init ──────────────────────────────────────────────────────────
+// ── Init ────────────────────────────────────────────────────────────────────
 loadStats();
 </script>
 </body></html>"""
-
-
-
-# == MULTILINGUAL INFRASTRUCTURE ============================================
-# Supported languages — add Russian RAG data when embeddings are ready.
-# Structure: language code → metadata.
-# To activate Russian: run embed_generator.py with ACTIVE_LANGS=["ru"]
-# then set the language column in aistalin_chunks.
-
-SUPPORTED_LANGUAGES = {
-    "ka": {
-        "name":        "ქართული",
-        "name_en":     "Georgian",
-        "rag_ready":   True,    # Embedded in pgvector ✓
-        "chunks_col":  "ka",
-    },
-    "en": {
-        "name":        "English",
-        "name_en":     "English",
-        "rag_ready":   True,    # Embedded ✓
-        "chunks_col":  "en",
-    },
-    "ru": {
-        "name":        "Русский",
-        "name_en":     "Russian",
-        "rag_ready":   False,   # Pending — run embed_generator.py with ru
-        "chunks_col":  "ru",
-    },
-    # Future: "de", "fr", "zh", "es"
-}
-
-@app.get("/languages")
-async def get_languages():
-    """Returns supported languages + RAG readiness status.
-    Frontend uses this to grey out unavailable language buttons.
-    """
-    return {
-        "languages": {
-            k: {
-                "name":      v["name"],
-                "name_en":   v["name_en"],
-                "rag_ready": v["rag_ready"],
-            }
-            for k, v in SUPPORTED_LANGUAGES.items()
-        }
-    }
 
 
 # == SEARCH MODELS ===========================================================
