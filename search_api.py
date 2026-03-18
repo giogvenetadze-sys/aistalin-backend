@@ -55,6 +55,12 @@ CHAT_TOP_K          = 4   # fused chunks passed to generation (was 5)
 CHAT_SOURCE_LIMIT   = 3   # max sources returned in response
 PREMIUM_MEMORY_DAYS = 10  # how far back to look for premium chat history
 PREMIUM_MEMORY_TURNS = 5  # max turns injected directly into prompt
+
+# Minimum RRF score for a chunk to be considered "genuinely relevant".
+# RRF scores range roughly 0.01–0.033. Below this threshold the retrieval
+# matched something weakly (e.g. greetings, meta-questions) and sources
+# should not be shown even if chunks were returned.
+RRF_SOURCE_THRESHOLD = 0.016
 COOKIE_NAME      = "aistalin_session"
 COOKIE_DAYS      = 365
 
@@ -2438,7 +2444,7 @@ def _generate(prompt: str):
         model_name=CHAT_MODEL,
         system_instruction=SYSTEM_INSTRUCTION,
         generation_config=genai.types.GenerationConfig(
-            max_output_tokens=1024,   # ~750 words — enough for 3 full paragraphs
+            max_output_tokens=1800,   # Georgian tokenizes ~2-3x heavier than EN; 1800 ≈ 600 Georgian words
             temperature=0.25          # low = factual, consistent, Stalin-style analytical
         )
     )
@@ -2571,11 +2577,19 @@ async def chat(
         answer = gen.text.strip()
 
     info_not_found = any(p.lower() in answer.lower() for p in NO_INFO_PHRASES)
-    sources = [] if info_not_found else [
+
+    # Show sources only when:
+    # 1. Answer is not "not found"
+    # 2. At least one chunk has RRF score above threshold (genuinely relevant retrieval)
+    # This prevents sources appearing for greetings, meta-questions, or weak matches.
+    top_score = chunks[0]["score"] if chunks else 0.0
+    sources_relevant = (not info_not_found) and (top_score >= RRF_SOURCE_THRESHOLD)
+
+    sources = [
         SourceItem(chunk_id=c["chunk_id"], work_id=c["work_id"], title=c["title"],
                    volume_num=c.get("volume_num"), score=c["score"])
-        for c in chunks[:CHAT_SOURCE_LIMIT]  # max 3 sources in ranked order
-    ]
+        for c in chunks[:CHAT_SOURCE_LIMIT]
+    ] if sources_relevant else []
 
     today = datetime.date.today()  # compute once — used by both save and limit blocks
 
