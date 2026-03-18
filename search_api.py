@@ -1028,150 +1028,296 @@ _LEGAL_CSS = """
     opacity:.55;display:flex;gap:1.5rem;flex-wrap:wrap}
   .footer-links a{color:rgba(212,184,150,.7)}
   strong{color:#e0c880}
+  .lang-bar{display:flex;gap:.5rem;margin-bottom:1.75rem}
+  .lang-btn{padding:.3rem .85rem;border:1px solid rgba(92,45,15,.55);border-radius:3px;
+            background:transparent;color:rgba(212,184,150,.6);font-family:Georgia,serif;
+            font-size:.8rem;cursor:pointer;text-decoration:none;transition:all .2s}
+  .lang-btn:hover,.lang-btn.active{border-color:#d4a017;color:#d4a017;background:rgba(212,160,23,.07)}
 """
 
-def _legal_page(title: str, body_html: str) -> str:
-    return f"""<!doctype html><html lang="ka"><head>
+# Legal page labels per language
+_LEGAL_LABELS = {
+    "ka": {
+        "back":    "← AiStalin.io",
+        "terms":   "მომსახურების პირობები",
+        "privacy": "კონფიდენციალურობა",
+        "refund":  "თანხის დაბრუნება",
+    },
+    "en": {
+        "back":    "← AiStalin.io",
+        "terms":   "Terms of Service",
+        "privacy": "Privacy Policy",
+        "refund":  "Refund Policy",
+    },
+    "ru": {
+        "back":    "← AiStalin.io",
+        "terms":   "Условия использования",
+        "privacy": "Политика конфиденциальности",
+        "refund":  "Политика возврата",
+    },
+}
+
+def _legal_page(title: str, body_html: str, lang: str = "ka", page: str = "terms") -> str:
+    """Render a self-contained legal HTML page with language switcher."""
+    lb   = _LEGAL_LABELS.get(lang, _LEGAL_LABELS["ka"])
+    base = page  # "terms" | "privacy" | "refund"
+    def _btn(l, flag, label):
+        active = " active" if l == lang else ""
+        return f'<a class="lang-btn{active}" href="/{base}?lang={l}">{flag} {label}</a>'
+    lang_bar = (
+        '<div class="lang-bar">\n'
+        + _btn("ka", "🇬🇪", "ქართული") + "\n"
+        + _btn("en", "🇬🇧", "English")  + "\n"
+        + _btn("ru", "🇷🇺", "Русский")  + "\n"
+        + '</div>'
+    )
+    footer_links = (
+        f'<a href="/terms?lang={lang}">{lb["terms"]}</a>\n'
+        f'  <a href="/privacy?lang={lang}">{lb["privacy"]}</a>\n'
+        f'  <a href="/refund?lang={lang}">{lb["refund"]}</a>\n'
+        f'  <a href="mailto:contact@aistalin.io">contact@aistalin.io</a>'
+    )
+    return f"""<!doctype html><html lang="{lang}"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} — AiStalin.io</title>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&family=Cormorant+Garamond:ital,wght@0,400;1,400&display=swap" rel="stylesheet">
-<style>{_LEGAL_CSS}</style>
+<style>{{_LEGAL_CSS}}</style>
 </head><body><div class="wrap">
-<a href="https://aistalin.io" class="back">&#8592; AiStalin.io</a>
+<a href="https://aistalin.io" class="{lb["back"][:2]}back">&#8592; AiStalin.io</a>
+{lang_bar}
 {body_html}
 <div class="footer-links">
-  <a href="/terms">მომსახურების პირობები</a>
-  <a href="/privacy">კონფიდენციალურობა</a>
-  <a href="/refund">თანხის დაბრუნება</a>
-  <a href="mailto:contact@aistalin.io">contact@aistalin.io</a>
+  {footer_links}
 </div>
 </div></body></html>"""
 
 
 @app.get("/terms", response_class=HTMLResponse)
-async def terms_page():
-    body = """
+async def terms_page(lang: str = "ka"):
+    if lang not in ("ka", "en", "ru"): lang = "ka"
+
+    bodies = {
+        "ka": """
 <h1>მომსახურების პირობები</h1>
 <p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">ბოლო განახლება: 2025 წელი</p>
-
 <p>კეთილი იყოს თქვენი მობრძანება AiStalin-ზე. ამ ვებსაიტისა და მასთან დაკავშირებული სერვისების გამოყენებით თქვენ ეთანხმებით ქვემოთ მოცემულ პირობებს. თუ ამ პირობებს არ ეთანხმებით, გთხოვთ არ გამოიყენოთ ჩვენი სერვისი.</p>
-
 <h2>1. სერვისის აღწერა</h2>
 <p>AiStalin წარმოადგენს ონლაინ ისტორიულ ბიბლიოთეკასა და AI-ზე დაფუძნებულ საძიებო პლატფორმას. სისტემა მომხმარებლებს აძლევს შესაძლებლობას:</p>
-<ul><li>დაათვალიერონ ისტორიული ტექსტები</li>
-<li>გამოიყენონ უფასო საძიებო სისტემა</li>
-<li>გამოიყენონ AI ჩატი ტექსტების მოძებნაში</li></ul>
+<ul><li>დაათვალიერონ ისტორიული ტექსტები</li><li>გამოიყენონ უფასო საძიებო სისტემა</li><li>გამოიყენონ AI ჩატი ტექსტების მოძებნაში</li></ul>
 <p>სერვისის ნაწილი ხელმისაწვდომია უფასოდ, ხოლო AI ჩატის სრული ფუნქციონალი ხელმისაწვდომია პრემიუმ წევრობის ფარგლებში.</p>
-
 <h2>2. კონტენტის წყაროები</h2>
 <p>ვებსაიტზე ხელმისაწვდომი ისტორიული ტექსტები აღებულია საჯარო არქივებიდან:</p>
-<ul><li><strong>Marxists Internet Archive</strong> (marxists.org)</li>
-<li><strong>RevolutionaryDemocracy.org</strong></li></ul>
+<ul><li><strong>Marxists Internet Archive</strong> (marxists.org)</li><li><strong>RevolutionaryDemocracy.org</strong></li></ul>
 <p>AiStalin არ აცხადებს საკუთრების უფლებას ამ ტექსტებზე. პლატფორმა წარმოადგენს ტექნოლოგიურ ინსტრუმენტს ამ არქივებში მასალის მოძიებისთვის.</p>
-
 <h2>3. ტექსტების გამოყენება</h2>
 <p>ამ არქივებიდან მიღებული მასალები გავრცელებულია თავისუფლად. მომხმარებლებს შეუძლიათ ტექსტების კითხვა, ციტირება და კოპირება იმ პირობებით, რომლებიც დაშვებულია ორიგინალი არქივების მიერ.</p>
-
 <h2>4. ანგარიშის შექმნა</h2>
 <p>ზოგიერთი ფუნქციის გამოყენებისთვის შეიძლება საჭირო გახდეს ანგარიშის შექმნა. მომხმარებელი პასუხისმგებელია ანგარიშის ინფორმაციის სისწორეზე, პაროლის უსაფრთხოებაზე და ანგარიშის გამოყენებაზე.</p>
-
 <h2>5. გადახდები და გამოწერა</h2>
 <p>პლატფორმის ზოგიერთი ფუნქცია ხელმისაწვდომია ფასიანი გამოწერის საშუალებით. გადახდები მუშავდება მესამე მხარის გადახდის სისტემის — <strong>Paddle</strong>-ის მეშვეობით. გამოწერა შეიძლება განახლდეს ავტომატურად ბილინგის პერიოდის დასრულების შემდეგ.</p>
-
 <h2>6. AI პასუხები</h2>
 <p>AI ჩატი წარმოადგენს საინფორმაციო ინსტრუმენტს. პასუხები ეფუძნება ისტორიულ ტექსტებს, მაგრამ შეიძლება იყოს არასრული. მომხმარებელმა მნიშვნელოვანი გადაწყვეტილებები არ უნდა მიიღოს მხოლოდ ამ სისტემის პასუხებზე დაყრდნობით.</p>
-
 <h2>7. პასუხისმგებლობის შეზღუდვა</h2>
 <p>სერვისი მიეწოდება არსებული მდგომარეობით. AiStalin არ აგებს პასუხს არაპირდაპირ ან შემთხვევით ზიანზე სერვისის გამოყენების შედეგად.</p>
-
 <h2>8. ცვლილებები</h2>
 <p>ეს პირობები შეიძლება განახლდეს. განახლებული ვერსია გამოქვეყნდება ამ გვერდზე.</p>
-
 <h2>9. კონტაქტი</h2>
 <p><a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
-"""
-    return _legal_page("მომსახურების პირობები", body)
+""",
+        "en": """
+<h1>Terms of Service</h1>
+<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">Last updated: 2025</p>
+<p>Welcome to AiStalin. By using this website and its associated services, you agree to the terms set out below. If you do not agree, please do not use our service.</p>
+<h2>1. Description of Service</h2>
+<p>AiStalin is an online historical library and AI-powered research platform. The system allows users to:</p>
+<ul><li>Browse historical texts</li><li>Use a free full-text search engine</li><li>Use the AI chat assistant to explore texts</li></ul>
+<p>Part of the service is available free of charge. The full AI chat functionality is available under a Premium membership.</p>
+<h2>2. Content Sources</h2>
+<p>The historical texts available on this website are sourced from public archives:</p>
+<ul><li><strong>Marxists Internet Archive</strong> (marxists.org)</li><li><strong>RevolutionaryDemocracy.org</strong></li></ul>
+<p>AiStalin does not claim ownership of these texts. The platform is a technological tool for locating material within these archives.</p>
+<h2>3. Use of Texts</h2>
+<p>Materials derived from these archives are freely distributed. Users may read, quote and copy texts subject to the terms permitted by the original archives.</p>
+<h2>4. Account Creation</h2>
+<p>Some features may require you to create an account. You are responsible for the accuracy of your account information, the security of your password, and all activity under your account.</p>
+<h2>5. Payments and Subscriptions</h2>
+<p>Some features are available via a paid subscription. Payments are processed by the third-party payment provider <strong>Paddle</strong>. Subscriptions may renew automatically at the end of each billing period.</p>
+<h2>6. AI Responses</h2>
+<p>The AI chat is an informational tool. Responses are based on historical texts but may be incomplete. Users should not make significant decisions based solely on the system's outputs.</p>
+<h2>7. Limitation of Liability</h2>
+<p>The service is provided as-is. AiStalin is not liable for indirect or incidental damages resulting from use of the service.</p>
+<h2>8. Changes</h2>
+<p>These terms may be updated. The updated version will be published on this page.</p>
+<h2>9. Contact</h2>
+<p><a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
+""",
+        "ru": """
+<h1>Условия использования</h1>
+<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">Последнее обновление: 2025 г.</p>
+<p>Добро пожаловать на AiStalin. Используя этот сайт и связанные с ним сервисы, вы соглашаетесь с приведёнными ниже условиями. Если вы не принимаете эти условия, пожалуйста, не пользуйтесь нашим сервисом.</p>
+<h2>1. Описание сервиса</h2>
+<p>AiStalin — онлайн-историческая библиотека и исследовательская платформа на базе ИИ. Система позволяет пользователям:</p>
+<ul><li>Просматривать исторические тексты</li><li>Использовать бесплатную поисковую систему</li><li>Использовать ИИ-чат для работы с текстами</li></ul>
+<p>Часть сервиса доступна бесплатно. Полная функциональность ИИ-чата доступна в рамках Премиум-подписки.</p>
+<h2>2. Источники контента</h2>
+<p>Исторические тексты на этом сайте получены из публичных архивов:</p>
+<ul><li><strong>Marxists Internet Archive</strong> (marxists.org)</li><li><strong>RevolutionaryDemocracy.org</strong></li></ul>
+<p>AiStalin не претендует на владение этими текстами. Платформа является технологическим инструментом для поиска материалов в этих архивах.</p>
+<h2>3. Использование текстов</h2>
+<p>Материалы из указанных архивов распространяются свободно. Пользователи могут читать, цитировать и копировать тексты на условиях, разрешённых оригинальными архивами.</p>
+<h2>4. Создание аккаунта</h2>
+<p>Для использования некоторых функций может потребоваться создание аккаунта. Пользователь несёт ответственность за точность данных аккаунта, безопасность пароля и все действия под аккаунтом.</p>
+<h2>5. Платежи и подписки</h2>
+<p>Часть функций доступна по платной подписке. Платежи обрабатываются сторонней платёжной системой <strong>Paddle</strong>. Подписка может автоматически продлеваться по окончании расчётного периода.</p>
+<h2>6. Ответы ИИ</h2>
+<p>ИИ-чат является информационным инструментом. Ответы основаны на исторических текстах, но могут быть неполными. Не следует принимать важные решения, опираясь исключительно на ответы системы.</p>
+<h2>7. Ограничение ответственности</h2>
+<p>Сервис предоставляется «как есть». AiStalin не несёт ответственности за косвенный или случайный ущерб, возникший в результате использования сервиса.</p>
+<h2>8. Изменения</h2>
+<p>Настоящие условия могут обновляться. Актуальная версия будет опубликована на этой странице.</p>
+<h2>9. Контакты</h2>
+<p><a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
+""",
+    }
+    titles = {"ka": "მომსახურების პირობები", "en": "Terms of Service", "ru": "Условия использования"}
+    return _legal_page(titles[lang], bodies[lang], lang=lang, page="terms")
 
 
 @app.get("/privacy", response_class=HTMLResponse)
-async def privacy_page():
-    body = """
+async def privacy_page(lang: str = "ka"):
+    if lang not in ("ka", "en", "ru"): lang = "ka"
+
+    bodies = {
+        "ka": """
 <h1>კონფიდენციალურობის პოლიტიკა</h1>
 <p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">ბოლო განახლება: 2025 წელი</p>
-
 <p>AiStalin პატივს სცემს მომხმარებლის კონფიდენციალურობას. ეს პოლიტიკა განმარტავს, რა მონაცემებს ვაგროვებთ და როგორ ვიყენებთ მათ.</p>
-
 <h2>1. რა მონაცემებს ვაგროვებთ</h2>
-<ul><li>ელფოსტა ანგარიშის შექმნისას</li>
-<li>ჩატის შეტყობინებები (სერვისის გაუმჯობესებისთვის)</li>
-<li>ტექნიკური მონაცემები (IP, ბრაუზერი, მოწყობილობა)</li>
-<li>სისტემის ლოგები უსაფრთხოების მიზნით</li></ul>
-
+<ul><li>ელფოსტა ანგარიშის შექმნისას</li><li>ჩატის შეტყობინებები (სერვისის გაუმჯობესებისთვის)</li><li>ტექნიკური მონაცემები (IP, ბრაუზერი, მოწყობილობა)</li><li>სისტემის ლოგები უსაფრთხოების მიზნით</li></ul>
 <h2>2. როგორ ვიყენებთ მონაცემებს</h2>
-<ul><li>მომხმარებლის ანგარიშის სამართავად</li>
-<li>AI ჩატის ფუნქციონირებისთვის</li>
-<li>სისტემის გაუმჯობესებისთვის</li>
-<li>უსაფრთხოების მიზნით</li></ul>
-
+<ul><li>მომხმარებლის ანგარიშის სამართავად</li><li>AI ჩატის ფუნქციონირებისთვის</li><li>სისტემის გაუმჯობესებისთვის</li><li>უსაფრთხოების მიზნით</li></ul>
 <h2>3. გადახდები</h2>
 <p>გადახდები მუშავდება <strong>Paddle</strong>-ის მიერ. ჩვენ არ ვინახავთ სრულ საბარათე მონაცემებს ჩვენს სისტემაში.</p>
-
 <h2>4. Cookies</h2>
 <p>ვებსაიტი იყენებს cookies ავტორიზაციისთვის, სესიის სამართავად და გამოცდილების გასაუმჯობესებლად.</p>
-
 <h2>5. მონაცემების გაზიარება</h2>
 <p>ჩვენ <strong>არ ვყიდით</strong> მომხმარებლის მონაცემებს. მონაცემები შეიძლება გაზიარდეს მხოლოდ ტექნიკურ სერვის პროვაიდერებთან ან კანონით მოთხოვნილ შემთხვევებში.</p>
-
 <h2>6. კონტენტის წყაროები</h2>
-<p>ვებსაიტზე წარმოდგენილი ისტორიული მასალა მიღებულია ღია არქივებიდან (<strong>Marxists Internet Archive</strong>, <strong>RevolutionaryDemocracy.org</strong>). ეს მასალები ხელმისაწვდომია თავისუფლად.</p>
-
+<p>ვებსაიტზე წარმოდგენილი ისტორიული მასალა მიღებულია ღია არქივებიდან (<strong>Marxists Internet Archive</strong>, <strong>RevolutionaryDemocracy.org</strong>).</p>
 <h2>7. მონაცემების უსაფრთხოება</h2>
 <p>ვიყენებთ შესაბამის ტექნიკურ ზომებს (HTTPS, bcrypt password hashing, JWT tokens) მონაცემების დასაცავად.</p>
-
 <h2>8. ცვლილებები</h2>
 <p>ეს პოლიტიკა შეიძლება პერიოდულად განახლდეს.</p>
-
 <h2>9. კონტაქტი</h2>
 <p><a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
-"""
-    return _legal_page("კონფიდენციალურობის პოლიტიკა", body)
+""",
+        "en": """
+<h1>Privacy Policy</h1>
+<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">Last updated: 2025</p>
+<p>AiStalin respects user privacy. This policy explains what data we collect and how we use it.</p>
+<h2>1. Data We Collect</h2>
+<ul><li>Email address when creating an account</li><li>Chat messages (to improve the service)</li><li>Technical data (IP address, browser, device)</li><li>System logs for security purposes</li></ul>
+<h2>2. How We Use Data</h2>
+<ul><li>To manage your user account</li><li>To operate the AI chat functionality</li><li>To improve the system</li><li>For security purposes</li></ul>
+<h2>3. Payments</h2>
+<p>Payments are processed by <strong>Paddle</strong>. We do not store full card details on our systems.</p>
+<h2>4. Cookies</h2>
+<p>The website uses cookies for authentication, session management, and to improve the user experience.</p>
+<h2>5. Data Sharing</h2>
+<p>We do <strong>not sell</strong> user data. Data may be shared only with technical service providers or when required by law.</p>
+<h2>6. Content Sources</h2>
+<p>Historical material on this website is sourced from open archives (<strong>Marxists Internet Archive</strong>, <strong>RevolutionaryDemocracy.org</strong>). These materials are freely available.</p>
+<h2>7. Data Security</h2>
+<p>We apply appropriate technical measures (HTTPS, bcrypt password hashing, JWT tokens) to protect your data.</p>
+<h2>8. Changes</h2>
+<p>This policy may be updated periodically.</p>
+<h2>9. Contact</h2>
+<p><a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
+""",
+        "ru": """
+<h1>Политика конфиденциальности</h1>
+<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">Последнее обновление: 2025 г.</p>
+<p>AiStalin уважает конфиденциальность пользователей. Настоящая политика разъясняет, какие данные мы собираем и как мы их используем.</p>
+<h2>1. Какие данные мы собираем</h2>
+<ul><li>Адрес электронной почты при создании аккаунта</li><li>Сообщения в чате (для улучшения сервиса)</li><li>Технические данные (IP-адрес, браузер, устройство)</li><li>Системные журналы в целях безопасности</li></ul>
+<h2>2. Как мы используем данные</h2>
+<ul><li>Для управления аккаунтом пользователя</li><li>Для работы ИИ-чата</li><li>Для улучшения системы</li><li>В целях безопасности</li></ul>
+<h2>3. Платежи</h2>
+<p>Платежи обрабатываются <strong>Paddle</strong>. Мы не храним полные данные платёжных карт в наших системах.</p>
+<h2>4. Cookies</h2>
+<p>Сайт использует cookies для авторизации, управления сессией и улучшения работы сервиса.</p>
+<h2>5. Передача данных</h2>
+<p>Мы <strong>не продаём</strong> данные пользователей. Данные могут передаваться только техническим поставщикам услуг или в случаях, предусмотренных законодательством.</p>
+<h2>6. Источники контента</h2>
+<p>Исторические материалы на сайте получены из открытых архивов (<strong>Marxists Internet Archive</strong>, <strong>RevolutionaryDemocracy.org</strong>). Эти материалы находятся в свободном доступе.</p>
+<h2>7. Безопасность данных</h2>
+<p>Мы применяем соответствующие технические меры (HTTPS, bcrypt-хеширование паролей, JWT-токены) для защиты ваших данных.</p>
+<h2>8. Изменения</h2>
+<p>Настоящая политика может периодически обновляться.</p>
+<h2>9. Контакты</h2>
+<p><a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
+""",
+    }
+    titles = {"ka": "კონფიდენციალურობის პოლიტიკა", "en": "Privacy Policy", "ru": "Политика конфиденциальности"}
+    return _legal_page(titles[lang], bodies[lang], lang=lang, page="privacy")
 
 
 @app.get("/refund", response_class=HTMLResponse)
-async def refund_page():
-    body = """
+async def refund_page(lang: str = "ka"):
+    if lang not in ("ka", "en", "ru"): lang = "ka"
+
+    bodies = {
+        "ka": """
 <h1>თანხის დაბრუნების პოლიტიკა</h1>
 <p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">ბოლო განახლება: 2025 წელი</p>
-
 <p>ეს პოლიტიკა განმარტავს თანხის დაბრუნებისა და გამოწერის გაუქმების წესებს AiStalin-ის ფასიანი სერვისებისთვის.</p>
-
 <h2>1. გამოწერის ტიპი</h2>
 <p>AiStalin გთავაზობთ <strong>$5/თვე</strong> პრემიუმ გამოწერას, რომელიც იძლევა AI ჩატზე ულიმიტო წვდომას. გადახდები მუშავდება <strong>Paddle</strong>-ის მეშვეობით.</p>
-
 <h2>2. გამოწერის გაუქმება</h2>
-<p>გამოწერის გასაუქმებლად:</p>
-<ul>
-  <li><strong>ვარიანტი 1:</strong> Paddle-ისგან მიღებული დადასტურების ელფოსტიდან → <em>"Manage Subscription"</em> ბმულზე დააჭირეთ</li>
-  <li><strong>ვარიანტი 2:</strong> მოგვწერეთ <a href="mailto:contact@aistalin.io">contact@aistalin.io</a>-ზე გამოწერის გაუქმების მოთხოვნით</li>
-</ul>
+<ul><li><strong>ვარიანტი 1:</strong> Paddle-ისგან მიღებული დადასტურების ელფოსტიდან → <em>Manage Subscription</em> ბმულზე დააჭირეთ</li><li><strong>ვარიანტი 2:</strong> მოგვწერეთ <a href="mailto:contact@aistalin.io">contact@aistalin.io</a>-ზე</li></ul>
 <p>მიმდინარე ბილინგის პერიოდი ძალაში რჩება მის დასრულებამდე.</p>
-
 <h2>3. თანხის დაბრუნების წესი</h2>
 <p>ციფრული სერვისის ბუნებიდან გამომდინარე, უკვე დაწყებული ბილინგის პერიოდის თანხა, როგორც წესი, არ ბრუნდება.</p>
-
 <h2>4. გამონაკლისები</h2>
-<p>თანხის დაბრუნება შეიძლება განხილული იყოს შემდეგ შემთხვევებში:</p>
-<ul>
-  <li>დუბლირებული გადახდა</li>
-  <li>ტექნიკური შეცდომით არასწორი ჩამოჭრა</li>
-  <li>სერვისის ხანგრძლივი ტექნიკური გაუმართაობა</li>
-</ul>
-
+<ul><li>დუბლირებული გადახდა</li><li>ტექნიკური შეცდომით არასწორი ჩამოჭრა</li><li>სერვისის ხანგრძლივი ტექნიკური გაუმართაობა</li></ul>
 <h2>5. მოთხოვნის გაგზავნა</h2>
-<p>თანხის დაბრუნების განსახილველად მოგვწერეთ: <a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
-<p>მოთხოვნაში მიუთითეთ: თქვენი ელფოსტა, გადახდის თარიღი, პრობლემის აღწერა.</p>
-"""
-    return _legal_page("თანხის დაბრუნების პოლიტიკა", body)
+<p>მოთხოვნაში მიუთითეთ: თქვენი ელფოსტა, გადახდის თარიღი, პრობლემის აღწერა.<br><a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
+""",
+        "en": """
+<h1>Refund Policy</h1>
+<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">Last updated: 2025</p>
+<p>This policy explains the rules for refunds and subscription cancellations for AiStalin's paid services.</p>
+<h2>1. Subscription Type</h2>
+<p>AiStalin offers a <strong>$5/month</strong> Premium subscription that provides unlimited access to the AI chat. Payments are processed by <strong>Paddle</strong>.</p>
+<h2>2. Cancelling Your Subscription</h2>
+<ul><li><strong>Option 1:</strong> In the confirmation email from Paddle → click the <em>Manage Subscription</em> link</li><li><strong>Option 2:</strong> Email us at <a href="mailto:contact@aistalin.io">contact@aistalin.io</a> with a cancellation request</li></ul>
+<p>Your current billing period remains active until its end date.</p>
+<h2>3. Refund Policy</h2>
+<p>Due to the nature of digital services, fees already charged for an active billing period are generally non-refundable.</p>
+<h2>4. Exceptions</h2>
+<ul><li>Duplicate charge</li><li>Incorrect charge due to a technical error</li><li>Extended service outage</li></ul>
+<h2>5. Submitting a Request</h2>
+<p>Please include: your email address, the payment date, and a description of the issue.<br><a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
+""",
+        "ru": """
+<h1>Политика возврата средств</h1>
+<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">Последнее обновление: 2025 г.</p>
+<p>Настоящая политика разъясняет правила возврата средств и отмены подписки на платные сервисы AiStalin.</p>
+<h2>1. Тип подписки</h2>
+<p>AiStalin предлагает Премиум-подписку за <strong>$5 в месяц</strong>, обеспечивающую неограниченный доступ к ИИ-чату. Платежи обрабатываются через <strong>Paddle</strong>.</p>
+<h2>2. Отмена подписки</h2>
+<ul><li><strong>Вариант 1:</strong> В подтверждающем письме от Paddle → нажмите ссылку <em>Manage Subscription</em></li><li><strong>Вариант 2:</strong> Напишите нам на <a href="mailto:contact@aistalin.io">contact@aistalin.io</a> с запросом об отмене</li></ul>
+<p>Текущий расчётный период остаётся активным до его окончания.</p>
+<h2>3. Правила возврата</h2>
+<p>В связи с природой цифровых услуг, средства за уже начавшийся расчётный период, как правило, не возвращаются.</p>
+<h2>4. Исключения</h2>
+<ul><li>Двойное списание</li><li>Ошибочное списание вследствие технической ошибки</li><li>Длительный технический сбой сервиса</li></ul>
+<h2>5. Подача заявки</h2>
+<p>Укажите: ваш адрес электронной почты, дату платежа и описание проблемы.<br><a href="mailto:contact@aistalin.io">contact@aistalin.io</a></p>
+""",
+    }
+    titles = {"ka": "თანხის დაბრუნების პოლიტიკა", "en": "Refund Policy", "ru": "Политика возврата средств"}
+    return _legal_page(titles[lang], bodies[lang], lang=lang, page="refund")
 
 
 # == ADMIN ENDPOINTS ==========================================================
