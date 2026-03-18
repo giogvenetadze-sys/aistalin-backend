@@ -1096,7 +1096,7 @@ def _legal_page(title: str, body_html: str, lang: str = "ka", page: str = "terms
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title} — AiStalin.io</title>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&family=Cormorant+Garamond:ital,wght@0,400;1,400&display=swap" rel="stylesheet">
-<style>{{_LEGAL_CSS}}</style>
+<style>{_LEGAL_CSS}</style>
 </head><body><div class="wrap">
 <a href="https://aistalin.io" class="{lb["back"][:2]}back">&#8592; AiStalin.io</a>
 {lang_bar}
@@ -2304,8 +2304,8 @@ async function submitQuote() {{
     var r = await fetch(url, {{method:method, headers:getHeaders(), body:JSON.stringify(body)}});
     if(!r.ok) {{ toast('შენახვა ვერ მოხერხდა ('+r.status+')', false); return; }}
     toast(_editingQuoteId
-      ? '✓ ციტატა #'+_editingQuoteId+' განახლდა'+(qdate?' ('+qdate+')'):'')
-      : '✓ ციტატა დაემატა'+(qdate?' → გამოჩნდება '+qdate:''), true);
+      ? ('✓ ციტატა #'+_editingQuoteId+' განახლდა'+(qdate?' ('+qdate+')':''))
+      : ('✓ ციტატა დაემატა'+(qdate?' → '+qdate:'')), true);
     cancelEditQuote();
     loadQuotes();
   }} catch(e) {{ toast('Error: '+e.message, false); }}
