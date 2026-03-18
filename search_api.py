@@ -2330,6 +2330,8 @@ FORMAT RULES
 - Deliver grammatically precise, polished language regardless of the user's input quality.
 """
 
+CHAT_MODEL = "models/gemini-2.5-flash"
+
 # == PREMIUM MEMORY HELPER ===================================================
 async def _get_premium_memory(user_id: int, language: str) -> str:
     """
