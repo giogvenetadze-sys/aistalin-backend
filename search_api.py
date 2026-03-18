@@ -2686,8 +2686,10 @@ async def chat(
             "ru": "В архиве не найдено релевантной информации по данному запросу.",
         }.get(req.language, "No relevant information found in the archive.")
     else:
-        # Compact context: title + volume — label adapts to language
+        # Language-aware volume prefix: ტ. / Vol. / Т.
         _vol_prefix = {"ka": "ტ.", "en": "Vol.", "ru": "Т."}.get(req.language, "Vol.")
+
+        # Compact context: title + volume only (no extra metadata noise)
         context = "\n\n---\n\n".join(
             f"[{i}] {c['title']} ({_vol_prefix}{c.get('volume_num','?')})\n{c['chunk_text']}"
             for i, c in enumerate(chunks, 1)
