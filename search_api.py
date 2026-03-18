@@ -64,6 +64,75 @@ RRF_SOURCE_THRESHOLD = 0.016
 COOKIE_NAME      = "aistalin_session"
 COOKIE_DAYS      = 365
 
+# ── Query cache (in-memory, per process) ─────────────────────────────────
+# Caches final (answer, sources) for identical query+language pairs.
+# TTL: 6 hours. Max: 256 entries (LRU-eviction by insertion order).
+# Does NOT cache "not found" answers — those can change as corpus grows.
+import re as _re
+from collections import OrderedDict as _OD
+
+CACHE_TTL_SEC  = 6 * 3600   # 6 hours
+CACHE_MAX_SIZE = 256
+
+_query_cache: _OD = _OD()   # key → {"answer": str, "sources": list, "ts": float}
+
+def _cache_key(query: str, language: str) -> str:
+    """Normalise query to maximise cache hits for near-identical inputs."""
+    return language + ":" + _re.sub(r"\s+", " ", query.strip().lower())
+
+def _cache_get(key: str):
+    entry = _query_cache.get(key)
+    if not entry:
+        return None
+    if time.time() - entry["ts"] > CACHE_TTL_SEC:
+        _query_cache.pop(key, None)
+        return None
+    # Move to end (LRU touch)
+    _query_cache.move_to_end(key)
+    return entry
+
+def _cache_set(key: str, answer: str, sources: list):
+    if key in _query_cache:
+        _query_cache.move_to_end(key)
+    _query_cache[key] = {"answer": answer, "sources": sources, "ts": time.time()}
+    if len(_query_cache) > CACHE_MAX_SIZE:
+        _query_cache.popitem(last=False)   # evict oldest
+
+# ── Trivial / greeting query detector ────────────────────────────────────
+# Queries below MIN_SUBSTANTIVE_CHARS or matching GREETING_RE bypass RAG
+# entirely — no embedding call, no DB hit, no sources returned.
+MIN_SUBSTANTIVE_CHARS = 15
+
+_GREETINGS = {
+    # Georgian
+    "სალამი","გამარჯობა","მოგესალმებით","გამარჯობათ","მარჯობა",
+    "გამარჯვება","ჰეი","ჰი","სალამ",
+    # English
+    "hi","hello","hey","greetings","good morning","good evening",
+    "good afternoon","good day","howdy","yo","sup","what's up","whats up",
+    # Russian
+    "привет","здравствуйте","здравствуй","добрый день","добрый вечер",
+    "доброе утро","добро пожаловать","хай","приветствую",
+}
+
+_GREETING_PATTERN = _re.compile(
+    r"^\s*(" + "|".join(_re.escape(g) for g in _GREETINGS) + r")[!?.\s]*$",
+    _re.IGNORECASE | _re.UNICODE
+)
+
+_GREETING_REPLIES = {
+    "ka": "მოგესალმებით. რით შემიძლია დაგეხმაროთ?",
+    "en": "Greetings. How may I assist you?",
+    "ru": "Приветствую. Чем могу помочь?",
+}
+
+def _is_trivial(query: str) -> bool:
+    """True for greetings and very short non-substantive inputs."""
+    q = query.strip()
+    if len(q) < MIN_SUBSTANTIVE_CHARS:
+        return bool(_GREETING_PATTERN.match(q))
+    return False
+
 genai.configure(api_key=GEMINI_API_KEY)
 SMTP_HOST    = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT    = int(os.getenv("SMTP_PORT", "587"))
@@ -2479,6 +2548,25 @@ async def chat(
     if req.language not in ["en", "ka", "ru"]:
         raise HTTPException(400, "language must be en/ka/ru")
 
+    # ── Trivial / greeting bypass ─────────────────────────────────────────
+    # Short greetings skip RAG entirely — no embedding, no DB search, no sources.
+    if _is_trivial(req.query):
+        reply = _GREETING_REPLIES.get(req.language, _GREETING_REPLIES["en"])
+        return JSONResponse(content=ChatResponse(
+            query=req.query, answer=reply, sources=[]
+        ).dict())
+
+    # ── Cache lookup ──────────────────────────────────────────────────────
+    # Identical query+language within 6 hours returns instantly.
+    _ck = _cache_key(req.query, req.language)
+    _cached = _cache_get(_ck)
+    if _cached:
+        return JSONResponse(content=ChatResponse(
+            query=req.query,
+            answer=_cached["answer"],
+            sources=[SourceItem(**s) for s in _cached["sources"]]
+        ).dict())
+
     # 1. Session token — header takes priority (works on HTTP+HTTPS)
     #    Frontend stores it in localStorage and sends as X-Session-Token
     session_token = (
@@ -2611,6 +2699,11 @@ async def chat(
             """, session_token, client_ip, today)
 
     data = ChatResponse(query=req.query, answer=answer, sources=sources)
+
+    # Write to cache — only substantive answers (not "not found")
+    if not info_not_found:
+        _cache_set(_ck, answer, [s.dict() for s in sources])
+
     return _attach_session(JSONResponse(content=data.dict()))
 
 
