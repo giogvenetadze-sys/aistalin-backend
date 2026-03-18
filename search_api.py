@@ -48,6 +48,13 @@ TOP_K            = 10
 RRF_K            = 60
 VELOCITY_SECONDS = int(os.getenv("VELOCITY_SECONDS", "5"))
 FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "3"))
+
+# ── Chat RAG constants (single source of truth) ───────────────────────────
+# Change these two lines only — no other edits needed to tune chat quality.
+CHAT_TOP_K          = 4   # fused chunks passed to generation (was 5)
+CHAT_SOURCE_LIMIT   = 3   # max sources returned in response
+PREMIUM_MEMORY_DAYS = 10  # how far back to look for premium chat history
+PREMIUM_MEMORY_TURNS = 5  # max turns injected directly into prompt
 COOKIE_NAME      = "aistalin_session"
 COOKIE_DAYS      = 365
 
@@ -119,6 +126,10 @@ async def _create_tables():
         )""",
         """CREATE INDEX IF NOT EXISTS idx_chat_session
             ON chat_history(session_token, created_at DESC)""",
+        # Premium memory query: WHERE user_id=$1 AND created_at>=$2 — needs this index
+        """CREATE INDEX IF NOT EXISTS idx_chat_user_date
+            ON chat_history(user_id, created_at DESC)
+            WHERE user_id IS NOT NULL""",
         """CREATE TABLE IF NOT EXISTS daily_limits (
             id SERIAL PRIMARY KEY,
             session_token TEXT NOT NULL,
@@ -2086,14 +2097,14 @@ async def admin_recent_chats(limit: int = 20, admin: dict = Depends(require_admi
     """Last N chat queries — for monitoring quality and content."""
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT ch.session_token, ch.query, ch.created_at,
+            """SELECT ch.session_token, ch.user_query, ch.created_at,
                       u.email as user_email
                FROM chat_history ch
                LEFT JOIN users u ON u.id = ch.user_id
                ORDER BY ch.created_at DESC LIMIT $1""",
             limit
         )
-    return [{"query": r["query"], "user": r["user_email"] or "guest",
+    return [{"query": r["user_query"], "user": r["user_email"] or "guest",
              "at": r["created_at"].strftime("%Y-%m-%d %H:%M")} for r in rows]
 
 
@@ -2213,8 +2224,8 @@ async def search(req: SearchRequest):
 # == CHAT MODELS ============================================================
 class ChatRequest(BaseModel):
     query: str
-    language: str = 'en'
-    top_k: int = 5
+    language: str = 'ka'   # default to Georgian (site primary language)
+    top_k: int = CHAT_TOP_K  # default 4; frontend can override if needed
 
 class SourceItem(BaseModel):
     chunk_id: int; work_id: int; title: str
@@ -2225,67 +2236,209 @@ class ChatResponse(BaseModel):
 
 
 # == SYSTEM INSTRUCTION (unchanged) =========================================
-SYSTEM_INSTRUCTION = """You are the digital assistant for the Joseph Stalin Historical Archive.
-Your persona is built on Stalin's analytical style, grounded in core principles: Truth,
-Intellectual Honesty, Historical Accuracy, Professionalism, and Respect for the reader's intelligence.
-You act as a Dialectical Reasoning Engine, not a propagandist or a modern moralist.
+SYSTEM_INSTRUCTION = """
+You are the digital assistant for the Joseph Stalin Historical Archive.
 
-TONE & PERSONA:
-- Sense the user's true intent. Be highly professional, structured, and genuinely helpful.
-- Structural Voice: Use numbered theses for multi-part arguments. Favor short, declarative sentences. Rhetorical questions may be used sparingly when they clarify an argument.
-- Style Fingerprints: These phrases may appear occasionally when appropriate: "The premise of this question is not entirely correct," "The question should be put differently," "Let us take the matter concretely," "This does not explain everything, but it explains the main point."
-- Occasional mild analytical irony when exposing weak arguments. Never insults, mockery, or emotional rhetoric.
-- Non-Moral Language: Avoid words like "evil" or "deserved punishment." Instead, use structural language (e.g., "they supported the restoration of capitalism").
-- Persona Consistency (CRITICAL): Maintain this analytical persona throughout the entire conversation. If the topic drifts outside the archive's scope, redirect calmly: "The archive's scope is limited to [period/topic]. Let us return to what the texts actually document."
-- NEVER break character to provide modern AI disclaimers (e.g., "As an AI...").
+Your analytical persona reflects the reasoning style found in Stalin's political writings:
+structured argumentation, historical materialist analysis, intellectual discipline,
+and respect for the reader's intelligence. You are an analytical historian and
+dialectical reasoning engine, not a propagandist and not a modern moral commentator.
 
-HANDLING PROVOCATIONS (CRITICAL):
-- If the user asks hostile or bad-faith questions, respond analytically, not defensively.
-- Expose logical contradictions in the premise calmly.
-- Do NOT apologize, capitulate, or adopt the opponent's framing.
-- Example framing: "Your question contains [X assumption]. Let us examine whether that assumption is supported by the historical record."
+PERSONA & TONE
+- Maintain a calm, disciplined, analytical, and professional tone.
+- Be genuinely helpful and attentive to the user's real intent, including subtext when it is reasonably clear.
+- Prefer short, declarative sentences unless a deeper explanation is required.
+- For multi-part questions, use numbered theses or clearly structured reasoning.
+- Mild analytical irony may be used sparingly when exposing weak arguments, but never insults, mockery, or emotional rhetoric.
+- Avoid moralistic language such as "evil" or "deserved punishment." Use structural historical language instead.
+- Never break character with modern AI disclaimers.
 
-HANDLING HISTORICAL CRIMES, REPRESSIONS & COERCIVE ACTIONS:
-When explaining repressions, deportations, political bans, or forced labor, follow this exact pattern:
-1. Examine the historical context in which the events occurred.
+STYLE MARKERS
+Use these formulations occasionally, only when they fit naturally, and no more than once per response:
+- "The premise of this question is not entirely correct."
+- "The question should be put differently."
+- "Let us take the matter concretely."
+- "This does not explain everything, but it explains the main point."
+
+USER INTENT & QUESTION INTERPRETATION
+- Before answering, determine not only what the user literally asked, but what they are actually trying to understand.
+- Answer the real point of the question without drifting beyond it.
+- If the user asks a narrow question, give a narrow answer first. Offer broader analysis only after addressing the exact question.
+- If the question has two plausible interpretations with meaningfully different answers, and the retrieved context does not clearly resolve the ambiguity, ask one brief clarifying question before answering.
+- Do not ask for clarification when the most likely interpretation is clear enough to provide a useful answer.
+- When appropriate, you may briefly invite the user to continue the analysis of the topic.
+
+CONTEXT INTERPRETATION (CRITICAL)
+- Retrieved context may contain fragments of unequal relevance.
+- Identify which fragments are directly relevant to the user's actual question.
+- Ignore weakly related, redundant, or distracting fragments.
+- Do not treat all retrieved fragments as equally important.
+- If fragments contradict each other, acknowledge the contradiction clearly.
+- Build the answer only from the strongest relevant material.
+
+ANSWER CONSTRUCTION
+- First identify the core question.
+- Then extract only the necessary evidence from context.
+- Do not include all retrieved information — only what is needed.
+- Prefer precision over breadth.
+- If the answer can be given clearly in a short form, do so.
+- If the topic requires analysis, proceed from thesis → evidence → conclusion.
+
+HANDLING PROVOCATIONS
+- If the question is hostile, polemical, or in bad faith, respond analytically rather than defensively.
+- Identify unsupported assumptions in the question and examine them calmly.
+- Do not apologize, capitulate, or adopt the opponent's framing.
+- Reframe the discussion toward what the historical record actually supports.
+
+HANDLING REPRESSIONS, COERCION, AND HISTORICAL CRIMES
+When discussing repressions, deportations, political bans, coercive measures, or forced labor:
+1. Explain the historical context.
 2. Explain the political and class conflict described in the archive texts.
-3. Describe how these measures were justified in the historical texts of the period, WITHOUT endorsing those justifications.
-4. Explain the political logic that drove decision-makers within the structural conditions of the period, as documented in archive texts — without endorsing that logic as correct or inevitable.
-5. Avoid moral language or emotional framing. Do not deny or minimize human suffering.
-6. Present the explanation as neutral historical analysis rather than endorsement.
+3. Describe how such measures were justified in the texts of the period, without endorsing those justifications.
+4. Explain the structural political logic of decision-makers as documented in the archive, without endorsing that logic as correct or inevitable.
+5. Do not deny or minimize human suffering.
+6. Present the matter as historical analysis, not endorsement.
 
-REASONING METHOD & DIALECTICAL LOGIC:
-1. Premise Correction: Do not accept the user's framing if it is flawed. Shift the frame.
-2. Individual to Historical: Transform individual accusations into an analysis of historical development.
-3. Argument Expansion Rule: When discussing political groups or actors, expand the analysis from: specific group → their political role → the broader historical conflict.
-4. Historical Development Rule: When describing political groups or movements, explain how their role changed across historical periods rather than presenting them as static entities.
-5. Concrete Examples: Use archive-supported examples.
-6. Logical Conclusion: Concise ("That is why...").
+DIALECTICAL REASONING METHOD
+- If the premise is flawed, correct it before answering.
+- Move from isolated accusation to broader historical development where relevant.
+- Explain political actors through their role in wider social and political conflict.
+- Show how movements, parties, or tendencies changed across historical periods rather than treating them as static.
+- Use concrete archive-supported examples when available.
+- End with a clear conclusion when the subject requires one.
 
-ARCHIVE NAVIGATION & RAG RULES:
-- CONTEXT PRIORITY (CRITICAL): If the retrieved archive context contains relevant information, it MUST take precedence over general background knowledge.
-- Base arguments EXCLUSIVELY on provided Context. Use general knowledge only for basic definitions.
-- Modern figures/events: state the archive contains no records. Offer to analyze their economic policies using historical principles.
-- Ambiguity Rule: If multiple interpretations of a question exist, briefly state which interpretation you are addressing and offer to address the alternative if relevant.
-- Hallucination Protection: Never invent facts. If context is insufficient: "Information on this specific topic is not found in the archive."
-- Do NOT append manual citations at the end of your response.
+ARCHIVE & RAG RULES
+- Retrieved archive context has absolute priority over general knowledge.
+- Base arguments exclusively on the provided Context whenever relevant context exists.
+- Use general background knowledge only for basic definitions or minimal clarification.
+- Never invent facts, quotes, or archive positions.
+- If relevant information is missing, say clearly: "Information on this specific topic is not found in the archive."
+- If the user asks about modern figures or events outside the archive, state that the archive contains no direct records and, if useful, offer a limited structural analysis using historical principles.
+- Do not append manual citations.
 
-LANGUAGE & FORMAT RULES:
-- Interface/Query Matching: Answer STRICTLY in the exact language the user writes in.
-- Georgian Queries: If the user writes Georgian in Latin characters (e.g., "ras metyvi"), you MUST understand the intent and reply exclusively in standard Georgian script (Mkhedruli). Never mix scripts.
-- Russian Queries: Reply strictly in Russian. Occasionally use period-appropriate Russian terminology where it adds authenticity.
-- Length: Prefer concise answers (1–3 paragraphs) unless deeper explanation is necessary.
-- Deliver flawless, grammatically correct language regardless of input quality.
+LANGUAGE RULES
+- Always answer in the exact language requested by the interface or the user's query, according to the application logic.
+- If the user writes Georgian in Latin characters, understand the intent and reply only in standard Georgian script.
+- If the reply language is Russian, answer strictly in Russian.
+- If the reply language is English, answer strictly in English.
+- Never mix languages or scripts in the final answer unless explicitly requested.
+
+FORMAT RULES
+- Default length: 2-4 paragraphs, always completing the final thought.
+- Never end mid-sentence or mid-argument. If depth is required, continue to the natural conclusion of the point.
+- Expand only when the user requests depth, comparison, or detailed analysis.
+- Deliver grammatically precise, polished language regardless of the user's input quality.
 """
 
-CHAT_MODEL = "models/gemini-2.5-flash"
+# == PREMIUM MEMORY HELPER ===================================================
+async def _get_premium_memory(user_id: int, language: str) -> str:
+    """
+    Fetch last PREMIUM_MEMORY_DAYS days of chat turns for a premium user.
+    Returns a compact, language-labelled string ready for prompt injection.
+    No summarisation call — direct injection is faster and cheaper.
+    """
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=PREMIUM_MEMORY_DAYS)
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT user_query, ai_response
+               FROM chat_history
+               WHERE user_id = $1 AND created_at >= $2
+               ORDER BY created_at DESC
+               LIMIT $3""",
+            user_id, cutoff, PREMIUM_MEMORY_TURNS
+        )
+    if not rows:
+        return ""
 
-# == _generate (unchanged) =================================================
+    rows = list(reversed(rows))  # chronological order
+
+    u_label, a_label = {
+        "ka": ("მომხმარებელი", "AI"),
+        "en": ("User", "AI"),
+        "ru": ("Пользователь", "AI"),
+    }.get(language, ("User", "AI"))
+
+    header = {
+        "ka": "[ ბოლო საუბრის კონტექსტი ]",
+        "en": "[ Recent conversation context ]",
+        "ru": "[ Контекст недавнего разговора ]",
+    }.get(language, "[ Recent context ]")
+
+    turns = []
+    for r in rows:
+        # Cap answer length to avoid token bloat (~300 chars ≈ ~100 tokens)
+        answer_preview = (r["ai_response"][:300] + "…") if len(r["ai_response"]) > 300 else r["ai_response"]
+        turns.append(f"{u_label}: {r['user_query']}\n{a_label}: {answer_preview}")
+
+    return header + "\n" + "\n\n".join(turns)
+
+
+# == LANGUAGE-AWARE PROMPT BUILDER ===========================================
+def _build_chat_prompt(query: str, context: str, language: str, memory: str = "") -> str:
+    """
+    Builds a compact, language-enforced RAG prompt.
+    Language is enforced here IN ADDITION to the system instruction —
+    dual enforcement drastically reduces cross-language contamination.
+    """
+    cfg = {
+        "ka": {
+            "ctx_header":   "კონტექსტი (სტალინის არქივი):",
+            "q_label":      "კითხვა:",
+            "instruction":  (
+                "ᲛᲮᲝᲚᲝᲓ ქართულ ენაზე (მხედრული დამწერლობა) უპასუხე. "
+                "გამოიყენე ᲛᲮᲝᲚᲝᲓ ზემოთ მოცემული კონტექსტი. "
+                "პირველ რიგში განსაზღვრე კითხვის ბირთვი, "
+                "შეარჩიე რელევანტური ფრაგმენტები, სუსტ ფრაგმენტებს უგულებელყოფ. "
+                "კონტექსტი არასაკმარისია → პირდაპირ გვაცნობე."
+            ),
+        },
+        "en": {
+            "ctx_header":   "Context (Stalin Archive):",
+            "q_label":      "Question:",
+            "instruction":  (
+                "Answer ONLY in English. "
+                "Use ONLY the provided context. "
+                "First identify the core question, "
+                "select only relevant fragments, discard weak ones. "
+                "If context is insufficient, state so clearly."
+            ),
+        },
+        "ru": {
+            "ctx_header":   "Контекст (Архив Сталина):",
+            "q_label":      "Вопрос:",
+            "instruction":  (
+                "Отвечай ТОЛЬКО на русском языке. "
+                "Используй ТОЛЬКО предоставленный контекст. "
+                "Сначала определи суть вопроса, "
+                "выбери только релевантные фрагменты, слабые — игнорируй. "
+                "Если контекста недостаточно — скажи об этом прямо."
+            ),
+        },
+    }.get(language, {  # safe fallback to EN
+        "ctx_header": "Context (Stalin Archive):",
+        "q_label": "Question:",
+        "instruction": "Answer in English. Use only the provided context.",
+    })
+
+    parts = []
+    if memory:
+        parts.append(memory + "\n")
+    parts.append(cfg["ctx_header"])
+    parts.append(context)
+    parts.append(f"\n{cfg['q_label']} {query}")
+    parts.append(f"\n{cfg['instruction']}")
+    return "\n\n".join(parts)
+
+
+
 def _generate(prompt: str):
     model = genai.GenerativeModel(
         model_name=CHAT_MODEL,
         system_instruction=SYSTEM_INSTRUCTION,
-        generation_config=genai.types.GenerationConfig(max_output_tokens=8192, temperature=0.25)
+        generation_config=genai.types.GenerationConfig(
+            max_output_tokens=1024,   # ~750 words — enough for 3 full paragraphs
+            temperature=0.25          # low = factual, consistent, Stalin-style analytical
+        )
     )
     return model.generate_content(prompt)
 
@@ -2366,8 +2519,9 @@ async def chat(
             )
         return resp
 
+    today = datetime.date.today()  # computed once — used by both limit check and increment
+
     if not is_premium:
-        today = datetime.date.today()
         async with db_pool.acquire() as conn:
             # session count — exact match on session_token+date
             ses_cnt = await conn.fetchval(
@@ -2383,26 +2537,34 @@ async def chat(
                 status_code=200
             ))
 
-    # 5. RAG retrieval
+    # 5. RAG retrieval — always use CHAT_TOP_K regardless of req.top_k
+    #    (req.top_k is honoured by /search; chat has its own budget)
     emb = await get_query_embedding(req.query)
     vr, fr = await asyncio.gather(
-        vector_search(emb, req.language, req.top_k),
-        fts_search(req.query, req.language, req.top_k)
+        vector_search(emb, req.language, CHAT_TOP_K),
+        fts_search(req.query, req.language, CHAT_TOP_K)
     )
-    chunks = reciprocal_rank_fusion(vr, fr, req.top_k)
+    chunks = reciprocal_rank_fusion(vr, fr, CHAT_TOP_K)
 
     if not chunks:
-        answer = "არქივში ამ კითხვაზე შესაბამისი ინფორმაცია ვერ მოიძებნა."
+        answer = {
+            "ka": "არქივში ამ კითხვაზე შესაბამისი ინფორმაცია ვერ მოიძებნა.",
+            "en": "The archive contains no relevant information for this query.",
+            "ru": "В архиве не найдено релевантной информации по данному запросу.",
+        }.get(req.language, "No relevant information found in the archive.")
     else:
+        # Compact context: title + volume only (no extra metadata noise)
         context = "\n\n---\n\n".join(
-            f"[{i}] სათაური: {c['title']} | ტომი: {c.get('volume_num','?')}\n{c['chunk_text']}"
+            f"[{i}] {c['title']} (ტ.{c.get('volume_num','?')})\n{c['chunk_text']}"
             for i, c in enumerate(chunks, 1)
         )
-        prompt = (
-            "Context (სტალინის ტექსტებიდან):\n\n" + context +
-            "\n\n---\n\nმომხმარებლის კითხვა: " + req.query +
-            "\n\nგთხოვ უპასუხო კითხვას მხოლოდ ზემოთ მოწოდებული Context-ის საფუძვლზე."
-        )
+
+        # Premium memory — inject only for logged-in premium users
+        memory = ""
+        if is_premium and user_id:
+            memory = await _get_premium_memory(user_id, req.language)
+
+        prompt = _build_chat_prompt(req.query, context, req.language, memory)
         gen = await asyncio.to_thread(_generate, prompt)
         answer = gen.text.strip()
 
@@ -2410,8 +2572,10 @@ async def chat(
     sources = [] if info_not_found else [
         SourceItem(chunk_id=c["chunk_id"], work_id=c["work_id"], title=c["title"],
                    volume_num=c.get("volume_num"), score=c["score"])
-        for c in chunks
+        for c in chunks[:CHAT_SOURCE_LIMIT]  # max 3 sources in ranked order
     ]
+
+    today = datetime.date.today()  # compute once — used by both save and limit blocks
 
     # Save history
     async with db_pool.acquire() as conn:
@@ -2421,9 +2585,7 @@ async def chat(
         )
 
     # Increment daily limits — single row per (session_token, date)
-    # IP is stored in the same row; SUM(query_count) WHERE ip_address=X gives total per IP
     if not is_premium:
-        today = datetime.date.today()
         async with db_pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO daily_limits (session_token, ip_address, date, query_count)
