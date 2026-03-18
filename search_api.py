@@ -273,16 +273,31 @@ async def _create_tables():
             text_en    TEXT,
             text_ru    TEXT,
             source     TEXT,
+            quote_date DATE,
             is_active  BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""",
         """CREATE INDEX IF NOT EXISTS idx_dq_active ON daily_quotes(is_active)""",
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_dq_date ON daily_quotes(quote_date)
+           WHERE quote_date IS NOT NULL""",
     ]
 
     # Create all tables FIRST
     async with db_pool.acquire() as conn:
         for s in stmts:
             await conn.execute(s)
+
+    # ── Schema migrations (idempotent — safe to re-run on every deploy) ───
+    async with db_pool.acquire() as conn:
+        for migration in [
+            "ALTER TABLE daily_quotes ADD COLUMN IF NOT EXISTS quote_date DATE",
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_dq_date ON daily_quotes(quote_date)
+               WHERE quote_date IS NOT NULL""",
+        ]:
+            try:
+                await conn.execute(migration)
+            except Exception as _me:
+                print(f"Migration note (safe to ignore): {_me}")
 
     # THEN seed default settings (table now exists)
     async with db_pool.acquire() as conn:
@@ -1412,43 +1427,109 @@ async def get_public_settings():
     return {r["key"]: r["value"] for r in rows}
 
 
+# ── Daily Quote auto-translation via Gemini Flash ────────────────────────────
+async def _auto_translate_quote(text_ka: str) -> tuple[str, str]:
+    """Translate Georgian Stalin quote → EN + RU using Gemini Flash.
+    Returns (text_en, text_ru). Falls back to ("","") on any error."""
+    prompt = (
+        "You are a professional translator specialising in Soviet-era political texts.\n"
+        "Translate the following Georgian quote attributed to Joseph Stalin "
+        "into English and Russian.\n\n"
+        "Rules:\n"
+        "- Preserve the original rhetorical register (disciplined, declarative, political)\n"
+        "- Do NOT add quotation marks, annotations, or preamble\n"
+        "- Output ONLY valid JSON: {\"en\": \"<English>\", \"ru\": \"<Russian>\"}\n\n"
+        f"Georgian original:\n{text_ka}"
+    )
+    def _call():
+        model = genai.GenerativeModel(
+            model_name="models/gemini-2.5-flash",
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=512, temperature=0.2,
+            )
+        )
+        return model.generate_content(prompt)
+    try:
+        gen  = await asyncio.to_thread(_call)
+        raw  = gen.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        import json as _j
+        data = _j.loads(raw)
+        return data.get("en", ""), data.get("ru", "")
+    except Exception as e:
+        print(f"⚠ Auto-translate failed: {e}")
+        return "", ""
+
+
 # ── Daily Quotes CRUD ──────────────────────────────────────────────────────
 @app.get("/admin/quotes")
 async def list_quotes(admin: dict = Depends(require_admin)):
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id,text_ka,text_en,text_ru,source,is_active,created_at FROM daily_quotes ORDER BY id DESC"
+            "SELECT id,text_ka,text_en,text_ru,source,is_active,quote_date,created_at FROM daily_quotes ORDER BY COALESCE(quote_date,'2099-12-31') ASC, id DESC"
         )
     return [{"id":r["id"],"text_ka":r["text_ka"],"text_en":r["text_en"],
-             "text_ru":r["text_ru"],"source":r["source"],"is_active":r["is_active"]} for r in rows]
+             "text_ru":r["text_ru"],"source":r["source"],"is_active":r["is_active"],
+             "quote_date": str(r["quote_date"]) if r["quote_date"] else None} for r in rows]
 
 class QuoteCreate(BaseModel):
-    text_ka:   str
-    text_en:   Optional[str] = None
-    text_ru:   Optional[str] = None
-    source:    Optional[str] = None
-    is_active: bool = True
+    text_ka:        str
+    text_en:        Optional[str] = None
+    text_ru:        Optional[str] = None
+    source:         Optional[str] = None
+    quote_date:     Optional[str] = None   # "YYYY-MM-DD"
+    is_active:      bool          = True
+    auto_translate: bool          = False  # if True → Gemini EN+RU
+
+@app.post("/admin/quotes/translate")
+async def translate_quote_endpoint(body: dict, admin: dict = Depends(require_admin)):
+    """Standalone translate: {"text_ka":"..."} → {"text_en":"...","text_ru":"..."}"""
+    text_ka = (body.get("text_ka") or "").strip()
+    if not text_ka:
+        raise HTTPException(400, "text_ka is required")
+    en, ru = await _auto_translate_quote(text_ka)
+    return {"text_en": en, "text_ru": ru}
+
 
 @app.post("/admin/quotes", status_code=201)
 async def create_quote(req: QuoteCreate, admin: dict = Depends(require_admin)):
+    import datetime as _dt
+    en, ru = req.text_en, req.text_ru
+    if req.auto_translate and (not en or not ru):
+        en, ru = await _auto_translate_quote(req.text_ka)
+    qdate = None
+    if req.quote_date:
+        try:    qdate = _dt.date.fromisoformat(req.quote_date)
+        except: raise HTTPException(400, "quote_date must be YYYY-MM-DD")
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            """INSERT INTO daily_quotes (text_ka,text_en,text_ru,source,is_active)
-               VALUES ($1,$2,$3,$4,$5) RETURNING id""",
-            req.text_ka, req.text_en, req.text_ru, req.source, req.is_active
+            """INSERT INTO daily_quotes (text_ka,text_en,text_ru,source,is_active,quote_date)
+               VALUES ($1,$2,$3,$4,$5,$6)
+               ON CONFLICT (quote_date)
+               DO UPDATE SET text_ka=$1,text_en=$2,text_ru=$3,source=$4,is_active=$5
+               RETURNING id""",
+            req.text_ka, en or None, ru or None, req.source, req.is_active, qdate
         )
-    return {"status":"created","id":row["id"]}
+    return {"status":"created","id":row["id"],"text_en":en,"text_ru":ru}
 
 @app.put("/admin/quotes/{qid}")
 async def update_quote(qid: int, req: QuoteCreate, admin: dict = Depends(require_admin)):
+    import datetime as _dt
+    en, ru = req.text_en, req.text_ru
+    if req.auto_translate and (not en or not ru):
+        en, ru = await _auto_translate_quote(req.text_ka)
+    qdate = None
+    if req.quote_date:
+        try:    qdate = _dt.date.fromisoformat(req.quote_date)
+        except: raise HTTPException(400, "quote_date must be YYYY-MM-DD")
     async with db_pool.acquire() as conn:
         r = await conn.execute(
-            """UPDATE daily_quotes SET text_ka=$1,text_en=$2,text_ru=$3,
-               source=$4,is_active=$5 WHERE id=$6""",
-            req.text_ka,req.text_en,req.text_ru,req.source,req.is_active,qid
+            """UPDATE daily_quotes
+               SET text_ka=$1,text_en=$2,text_ru=$3,source=$4,is_active=$5,quote_date=$6
+               WHERE id=$7""",
+            req.text_ka, en or None, ru or None, req.source, req.is_active, qdate, qid
         )
-    if r=="UPDATE 0": raise HTTPException(404,"Quote not found")
-    return {"status":"updated"}
+    if r == "UPDATE 0": raise HTTPException(404, "Quote not found")
+    return {"status":"updated","text_en":en,"text_ru":ru}
 
 @app.delete("/admin/quotes/{qid}")
 async def delete_quote(qid: int, admin: dict = Depends(require_admin)):
@@ -1457,20 +1538,29 @@ async def delete_quote(qid: int, admin: dict = Depends(require_admin)):
     if r=="DELETE 0": raise HTTPException(404,"Quote not found")
     return {"status":"deleted"}
 
-# Public endpoint — homepage uses this to get today's quote (from DB if available)
+# Public endpoint — priority: scheduled date → random active fallback
 @app.get("/quotes/today")
 async def get_today_quote():
+    """
+    1. Returns quote where quote_date = today (admin-scheduled).
+    2. Falls back to random active quote (day-seeded, consistent within a day).
+    3. Returns {"text_ka": null} if table is empty.
+    """
+    import datetime as _dt, time as _t
+    today = _dt.date.today()
     async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT text_ka,text_en,text_ru,source FROM daily_quotes WHERE is_active=TRUE ORDER BY id"
+        row = await conn.fetchrow(
+            "SELECT text_ka,text_en,text_ru,source FROM daily_quotes WHERE quote_date=$1 AND is_active=TRUE",
+            today
         )
-    if not rows:
-        return {"quote": None}
-    # Rotate by day-of-year
-    import time
-    idx = int(time.time() // 86400) % len(rows)
-    r = rows[idx]
-    return {"text_ka":r["text_ka"],"text_en":r["text_en"],"text_ru":r["text_ru"],"source":r["source"]}
+        if not row:
+            rows = await conn.fetch(
+                "SELECT text_ka,text_en,text_ru,source FROM daily_quotes WHERE is_active=TRUE ORDER BY id"
+            )
+            if not rows:
+                return {"text_ka": None}
+            row = rows[int(_t.time() // 86400) % len(rows)]
+    return {"text_ka":row["text_ka"],"text_en":row["text_en"],"text_ru":row["text_ru"],"source":row["source"]}
 
 
 # ── User Management ────────────────────────────────────────────────────────
@@ -1766,27 +1856,42 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
       <textarea id="q-ka" placeholder="„ციტატის ტექსტი..."" style="min-height:76px"></textarea>
     </div>
 
+    <!-- AI Auto-translate button -->
+    <div style="margin-bottom:.85rem;display:flex;align-items:center;gap:.75rem;flex-wrap:wrap">
+      <button id="q-translate-btn" class="btn btn-ghost btn-sm" onclick="autoTranslateQuote()">
+        <i class="fa fa-language" style="margin-right:.4rem"></i>
+        <span id="q-translate-label">🤖 AI ავტო-თარგმნა (EN + RU)</span>
+      </button>
+      <span id="q-translate-status" style="font-size:.75rem;opacity:.6"></span>
+    </div>
+
     <!-- EN + RU side by side -->
     <div class="grid-2" style="margin-bottom:.75rem">
       <div>
-        <label>English translation <span style="opacity:.45">(optional)</span></label>
+        <label>English translation <span style="opacity:.45">(optional — AI fills this)</span></label>
         <textarea id="q-en" placeholder='"Quote text..."' style="min-height:62px"></textarea>
       </div>
       <div>
-        <label>Русский перевод <span style="opacity:.45">(optional)</span></label>
+        <label>Русский перевод <span style="opacity:.45">(optional — AI fills this)</span></label>
         <textarea id="q-ru" placeholder='„Цитата..."' style="min-height:62px"></textarea>
       </div>
     </div>
 
-    <!-- Source + Active -->
+    <!-- Source + Date + Active -->
     <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1rem;align-items:flex-end">
-      <div style="flex:1;min-width:180px">
-        <label>წყარო <span style="opacity:.45">(მაგ: ტომი 11, გვ. 34)</span></label>
+      <div style="flex:1;min-width:160px">
+        <label>წყარო <span style="opacity:.45">(მაგ: ტომი 11)</span></label>
         <input id="q-src" type="text" placeholder="ტომი X">
+      </div>
+      <div style="min-width:160px">
+        <label>📅 გამოჩენის თარიღი <span style="opacity:.45">(სურვილისამებრ)</span></label>
+        <input id="q-date" type="date" style="background:var(--bg2);border:1px solid var(--border);
+               color:var(--cream);padding:.4rem .65rem;border-radius:4px;width:100%;
+               font-family:inherit;font-size:.85rem;cursor:pointer">
       </div>
       <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;padding-bottom:.45rem;white-space:nowrap">
         <input type="checkbox" id="q-active" checked style="accent-color:var(--gold);width:16px;height:16px">
-        <span style="font-size:.85rem">აქტიური (ჩვენება ჩართული)</span>
+        <span style="font-size:.85rem">აქტიური</span>
       </label>
     </div>
 
@@ -1816,6 +1921,7 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
           <th style="width:2.5rem">#</th>
           <th>ციტატა (KA)</th>
           <th class="hide-m" style="width:7rem">წყარო</th>
+          <th class="hide-m" style="width:6.5rem">📅 თარიღი</th>
           <th class="hide-m" style="width:3rem">EN</th>
           <th class="hide-m" style="width:3rem">RU</th>
           <th style="width:4rem">სტატ.</th>
@@ -1823,7 +1929,7 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
         </tr>
       </thead>
       <tbody id="q-tbody">
-        <tr><td colspan="7" style="text-align:center;padding:2.5rem;opacity:.35">
+        <tr><td colspan="8" style="text-align:center;padding:2.5rem;opacity:.35">
           <i class="fa fa-spinner fa-spin" style="margin-right:.5rem"></i>იტვირთება...
         </td></tr>
       </tbody>
@@ -2061,7 +2167,7 @@ async function loadQuotes() {{
   var tb  = document.getElementById('q-tbody');
   var lbl = document.getElementById('q-count-label');
   if(!tb) return;
-  tb.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:2rem;opacity:.35">' +
+  tb.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:2rem;opacity:.35">' +
     '<i class="fa fa-spinner fa-spin" style="margin-right:.5rem"></i>იტვირთება...</td></tr>';
   try {{
     var r = await fetch(API+'/admin/quotes', {{headers:getHeaders()}});
@@ -2082,6 +2188,7 @@ async function loadQuotes() {{
         +'<td style="opacity:.4;font-size:.8rem">'+(idx+1)+'</td>'
         +'<td style="font-family:Playfair Display,serif;font-size:.85rem;max-width:280px" title="'+(q.text_ka||'').replace(/"/g,"&quot;")+'">'+preview+'</td>'
         +'<td class="hide-m" style="opacity:.5;font-size:.8rem;white-space:nowrap">'+(q.source||'—')+'</td>'
+        +'<td class="hide-m" style="font-size:.78rem;text-align:center">'+(q.quote_date?'<span style="color:#d4a017;font-weight:600">'+q.quote_date+'</span>':'<span style="opacity:.25">—</span>')+'</td>'
         +'<td class="hide-m" style="text-align:center">'+(q.text_en?'<span style="color:#66bb6a;font-size:.85rem">✓</span>':'<span style="opacity:.3">—</span>')+'</td>'
         +'<td class="hide-m" style="text-align:center">'+(q.text_ru?'<span style="color:#66bb6a;font-size:.85rem">✓</span>':'<span style="opacity:.3">—</span>')+'</td>'
         +'<td>'+(q.is_active
@@ -2104,11 +2211,14 @@ function editQuote(id) {{
       .then(function(quotes){{ _quotesCache=quotes; editQuote(id); }});
     return;
   }}
-  document.getElementById('q-ka').value     = q.text_ka  || '';
-  document.getElementById('q-en').value     = q.text_en  || '';
-  document.getElementById('q-ru').value     = q.text_ru  || '';
-  document.getElementById('q-src').value    = q.source   || '';
+  document.getElementById('q-ka').value     = q.text_ka    || '';
+  document.getElementById('q-en').value     = q.text_en    || '';
+  document.getElementById('q-ru').value     = q.text_ru    || '';
+  document.getElementById('q-src').value    = q.source     || '';
+  document.getElementById('q-date').value   = q.quote_date || '';
   document.getElementById('q-active').checked = q.is_active;
+  var sta = document.getElementById('q-translate-status');
+  if(sta) sta.textContent = '';
   _editingQuoteId = id;
   // Update form UI
   var titleEl = document.getElementById('q-form-title');
@@ -2132,7 +2242,7 @@ function editQuote(id) {{
 
 function cancelEditQuote() {{
   _editingQuoteId = null;
-  ['q-ka','q-en','q-ru','q-src'].forEach(function(id){{
+  ['q-ka','q-en','q-ru','q-src','q-date'].forEach(function(id){{
     var el = document.getElementById(id);
     if(el) el.value='';
   }});
@@ -2148,29 +2258,60 @@ function cancelEditQuote() {{
   document.querySelectorAll('#q-tbody tr').forEach(function(row){{row.style.background='';}});
 }}
 
-async function submitQuote() {{
+async function autoTranslateQuote() {{
   var ka = document.getElementById('q-ka').value.trim();
+  if(!ka) {{ toast('⚠ ჯერ შეიყვანეთ ქართული ტექსტი', false); document.getElementById('q-ka').focus(); return; }}
+  var btn = document.getElementById('q-translate-btn');
+  var lbl = document.getElementById('q-translate-label');
+  var sta = document.getElementById('q-translate-status');
+  if(btn) btn.disabled = true;
+  if(lbl) lbl.textContent = 'ითარგმნება...';
+  if(sta) sta.textContent = '';
+  try {{
+    var r = await fetch(API+'/admin/quotes/translate', {{
+      method:'POST', headers:getHeaders(), body:JSON.stringify({{text_ka:ka}})
+    }});
+    if(!r.ok) {{ toast('თარგმნა ვერ მოხერხდა: '+r.status, false); return; }}
+    var d = await r.json();
+    if(d.text_en) document.getElementById('q-en').value = d.text_en;
+    if(d.text_ru) document.getElementById('q-ru').value = d.text_ru;
+    if(sta) sta.textContent = '✓ EN + RU დასრულდა';
+    toast('✓ AI თარგმნა წარმატებულია', true);
+  }} catch(e) {{
+    toast('Error: '+e.message, false);
+  }} finally {{
+    if(btn) btn.disabled = false;
+    if(lbl) lbl.textContent = '🤖 AI ავტო-თარგმნა (EN + RU)';
+  }}
+}}
+
+async function submitQuote() {{
+  var ka    = document.getElementById('q-ka').value.trim();
   if(!ka) {{ toast('⚠ ქართული ტექსტი სავალდებულოა', false); document.getElementById('q-ka').focus(); return; }}
-  var body = {{
-    text_ka:   ka,
-    text_en:   document.getElementById('q-en').value.trim() || null,
-    text_ru:   document.getElementById('q-ru').value.trim() || null,
-    source:    document.getElementById('q-src').value.trim() || null,
-    is_active: document.getElementById('q-active').checked
+  var qdate = document.getElementById('q-date').value.trim();
+  var body  = {{
+    text_ka:    ka,
+    text_en:    document.getElementById('q-en').value.trim() || null,
+    text_ru:    document.getElementById('q-ru').value.trim() || null,
+    source:     document.getElementById('q-src').value.trim() || null,
+    quote_date: qdate || null,
+    is_active:  document.getElementById('q-active').checked,
+    auto_translate: false
   }};
   try {{
     var url    = _editingQuoteId ? API+'/admin/quotes/'+_editingQuoteId : API+'/admin/quotes';
     var method = _editingQuoteId ? 'PUT' : 'POST';
     var r = await fetch(url, {{method:method, headers:getHeaders(), body:JSON.stringify(body)}});
     if(!r.ok) {{ toast('შენახვა ვერ მოხერხდა ('+r.status+')', false); return; }}
-    toast(_editingQuoteId ? '✓ ციტატა #'+_editingQuoteId+' განახლდა' : '✓ ციტატა დაემატა', true);
+    toast(_editingQuoteId
+      ? '✓ ციტატა #'+_editingQuoteId+' განახლდა'+(qdate?' ('+qdate+')'):'')
+      : '✓ ციტატა დაემატა'+(qdate?' → გამოჩნდება '+qdate:''), true);
     cancelEditQuote();
     loadQuotes();
   }} catch(e) {{ toast('Error: '+e.message, false); }}
 }}
 
-// Keep old addQuote() as alias for compatibility
-function addQuote() {{ submitQuote(); }}
+function addQuote() {{ submitQuote(); }}  // backward compat alias
 
 async function toggleQuoteActive(id, active) {{
   var q = _quotesCache.find(function(x){{return x.id===id;}});
