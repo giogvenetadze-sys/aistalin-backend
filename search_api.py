@@ -1501,14 +1501,27 @@ async def create_quote(req: QuoteCreate, admin: dict = Depends(require_admin)):
         try:    qdate = _dt.date.fromisoformat(req.quote_date)
         except: raise HTTPException(400, "quote_date must be YYYY-MM-DD")
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """INSERT INTO daily_quotes (text_ka,text_en,text_ru,source,is_active,quote_date)
-               VALUES ($1,$2,$3,$4,$5,$6)
-               ON CONFLICT (quote_date)
-               DO UPDATE SET text_ka=$1,text_en=$2,text_ru=$3,source=$4,is_active=$5
-               RETURNING id""",
-            req.text_ka, en or None, ru or None, req.source, req.is_active, qdate
-        )
+        if qdate is not None:
+            # Date set → use UPSERT (one quote per date, ON CONFLICT safe because
+            # the partial unique index covers non-NULL quote_date values only)
+            row = await conn.fetchrow(
+                """INSERT INTO daily_quotes (text_ka,text_en,text_ru,source,is_active,quote_date)
+                   VALUES ($1,$2,$3,$4,$5,$6)
+                   ON CONFLICT (quote_date) WHERE quote_date IS NOT NULL
+                   DO UPDATE SET text_ka=EXCLUDED.text_ka, text_en=EXCLUDED.text_en,
+                                 text_ru=EXCLUDED.text_ru, source=EXCLUDED.source,
+                                 is_active=EXCLUDED.is_active
+                   RETURNING id""",
+                req.text_ka, en or None, ru or None, req.source, req.is_active, qdate
+            )
+        else:
+            # No date → plain INSERT (NULLs are never unique, no conflict possible)
+            row = await conn.fetchrow(
+                """INSERT INTO daily_quotes (text_ka,text_en,text_ru,source,is_active,quote_date)
+                   VALUES ($1,$2,$3,$4,$5,$6)
+                   RETURNING id""",
+                req.text_ka, en or None, ru or None, req.source, req.is_active, None
+            )
     return {"status":"created","id":row["id"],"text_en":en,"text_ru":ru}
 
 @app.put("/admin/quotes/{qid}")
