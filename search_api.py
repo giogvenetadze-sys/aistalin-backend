@@ -575,6 +575,8 @@ def _resend_post(from_addr: str, to_email: str, subject: str, html_body: str) ->
 
 
 def _send_reset_email(to_email: str, reset_link: str):
+    print("🔥 USING RESEND_API_KEY:", RESEND_API_KEY[:10])
+    print("🔥 USING FROM:", RESEND_FROM)
     """Send password reset email via Resend HTTP API.
     Strategy:
       1. Try RESEND_FROM (custom domain, e.g. noreply@aistalin.io)
