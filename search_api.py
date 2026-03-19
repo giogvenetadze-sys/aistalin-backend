@@ -312,14 +312,23 @@ async def _create_tables():
             ("chat_height_px",    "400"),
             ("chat_scroll_px",    "38"),   # chat messages panel scroll speed
             ("reader_scroll_px",  "55"),   # reader body panel scroll speed
-            ("reader_font_size",  "16"),   # reader body font size (px)
-            ("chat_font_size",    "15"),   # chat messages font size (px)
             ("ui_lang_default",   "ka"),
             # Donate settings
             ("usdt_address",      "TNBNAYUxbw9LNqbmRjb8EAJ3gL9d19Sbb5"),
             ("usdt_qr_url",       ""),     # custom QR image URL (empty = auto-generate)
             ("paddle_link_5",     ""),     # direct Paddle/Stripe link for $5
             ("paddle_link_10",    ""),     # direct Paddle/Stripe link for $10
+            # Font sizes (px)
+            ("reader_font_size",  "16"),   # reader article body
+            ("chat_font_size",    "15"),   # chat messages
+            ("quote_font_size",   "18"),   # daily quote text
+            ("info_font_size",    "16"),   # about/info modal body
+            ("tablet_book_font",  "7"),    # tablet book spine (0.N rem * 10)
+            ("mobile_book_font",  "6"),    # mobile open-book widget (0.N rem * 10)
+            # Font style for daily quote (normal | italic | bold | bold-italic)
+            ("quote_font_style",  "italic"),
+            # Font family for daily quote (fell | crimson | playfair | georgia)
+            ("quote_font_family", "fell"),
         ]
         for k, v in defaults:
             await conn.execute(
@@ -1452,17 +1461,13 @@ async def _auto_translate_quote(text_ka: str) -> tuple[str, str]:
         )
         return model.generate_content(prompt)
     try:
-        gen = await asyncio.to_thread(_call)
-        import re as _re2, json as _j
-        raw = gen.text.strip()
-        # Extract JSON object regardless of surrounding markdown or text
-        m = _re2.search(r'\{[^{}]+\}', raw, _re2.DOTALL)
-        data = _j.loads(m.group(0) if m else raw)
-        en = (data.get("en") or data.get("English") or "").strip()
-        ru = (data.get("ru") or data.get("Russian") or "").strip()
-        return en, ru
+        gen  = await asyncio.to_thread(_call)
+        raw  = gen.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        import json as _j
+        data = _j.loads(raw)
+        return data.get("en", ""), data.get("ru", "")
     except Exception as e:
-        print(f"Auto-translate failed: {e}")
+        print(f"⚠ Auto-translate failed: {e}")
         return "", ""
 
 
@@ -2005,20 +2010,6 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
       </div>
     </div>
   </div>
-  <!-- Font Size -->
-  <div class="card">
-    <div class="card-title"><i class="fa fa-text-height"></i> ფონტის ზომა</div>
-    <div class="grid-2">
-      <div>
-        <label>📖 Reader Font Size (px) — სტატიის ფონტი</label>
-        <div class="range-row"><input type="range" min="12" max="24" step="1" id="s-rfont" oninput="rv('s-rfont-v',this.value,'px')"><span id="s-rfont-v">16px</span></div>
-      </div>
-      <div>
-        <label>💬 Chat Font Size (px) — ჩათ-პასუხის ფონტი</label>
-        <div class="range-row"><input type="range" min="11" max="20" step="1" id="s-cfont" oninput="rv('s-cfont-v',this.value,'px')"><span id="s-cfont-v">15px</span></div>
-      </div>
-    </div>
-  </div>
   <!-- Donate Settings -->
   <div class="card">
     <div class="card-title"><i class="fa fa-hand-holding-heart" style="color:#cc1b1b"></i> Donate Settings</div>
@@ -2040,6 +2031,70 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
       <div>
         <label>$10 Paddle/Stripe ლინკი</label>
         <input id="s-paddle10" type="text" placeholder="https://buy.paddle.com/...">
+      </div>
+    </div>
+  </div>
+
+  <!-- Font Sizes & Style -->
+  <div class="card">
+    <div class="card-title"><i class="fa fa-text-height"></i> ფონტის ზომა და სტილი</div>
+
+    <!-- Row 1: Reader + Chat -->
+    <div class="grid-2">
+      <div>
+        <label>📖 Reader Font (px) — სტატიის ტექსტი</label>
+        <div class="range-row"><input type="range" min="12" max="26" step="1" id="s-rfont" oninput="rv('s-rfont-v',this.value,'px')"><span id="s-rfont-v">16px</span></div>
+      </div>
+      <div>
+        <label>💬 Chat Font (px) — ჩათ-შეტყობინება</label>
+        <div class="range-row"><input type="range" min="11" max="22" step="1" id="s-cfont" oninput="rv('s-cfont-v',this.value,'px')"><span id="s-cfont-v">15px</span></div>
+      </div>
+    </div>
+
+    <!-- Row 2: Quote + Info modal -->
+    <div class="grid-2" style="margin-top:.85rem">
+      <div>
+        <label>💬 Daily Quote Font (px) — დღის ფრაზა</label>
+        <div class="range-row"><input type="range" min="11" max="28" step="1" id="s-qfont" oninput="rv('s-qfont-v',this.value,'px')"><span id="s-qfont-v">18px</span></div>
+      </div>
+      <div>
+        <label>📄 About/Info Modal Font (px)</label>
+        <div class="range-row"><input type="range" min="12" max="22" step="1" id="s-ifont" oninput="rv('s-ifont-v',this.value,'px')"><span id="s-ifont-v">16px</span></div>
+      </div>
+    </div>
+
+    <!-- Row 3: Tablet book + Mobile book -->
+    <div class="grid-2" style="margin-top:.85rem">
+      <div>
+        <label>📚 Tablet Book Spine Font (×0.1rem)</label>
+        <div class="range-row"><input type="range" min="4" max="12" step="1" id="s-tbfont" oninput="rv('s-tbfont-v',this.value,'×0.1rem')"><span id="s-tbfont-v">7×0.1rem</span></div>
+      </div>
+      <div>
+        <label>📱 Mobile Book Widget Font (×0.1rem)</label>
+        <div class="range-row"><input type="range" min="4" max="12" step="1" id="s-mbfont" oninput="rv('s-mbfont-v',this.value,'×0.1rem')"><span id="s-mbfont-v">6×0.1rem</span></div>
+      </div>
+    </div>
+
+    <!-- Row 4: Quote font family + style -->
+    <div class="grid-2" style="margin-top:.85rem">
+      <div>
+        <label>🖋 Daily Quote Font Family</label>
+        <select id="s-qfamily" style="width:100%;margin-top:.3rem">
+          <option value="fell">IM Fell English (Vintage)</option>
+          <option value="crimson">Crimson Text (Classic)</option>
+          <option value="playfair">Playfair Display (Elegant)</option>
+          <option value="georgia">Georgia (System)</option>
+        </select>
+      </div>
+      <div>
+        <label>✨ Daily Quote Font Style</label>
+        <div style="display:flex;gap:.5rem;margin-top:.5rem;flex-wrap:wrap">
+          <button class="btn btn-ghost btn-sm" onclick="setQuoteStyle('normal')">ჩვეულებრივი</button>
+          <button class="btn btn-ghost btn-sm" onclick="setQuoteStyle('italic')"><em>Italic</em></button>
+          <button class="btn btn-ghost btn-sm" onclick="setQuoteStyle('bold')"><strong>Bold</strong></button>
+          <button class="btn btn-ghost btn-sm" onclick="setQuoteStyle('bold-italic')"><strong><em>Bold+Italic</em></strong></button>
+        </div>
+        <p id="s-qstyle-preview" style="font-size:.75rem;margin-top:.4rem;opacity:.55">ამჟამინდელი: <span id="s-qstyle-val">italic</span></p>
       </div>
     </div>
   </div>
@@ -2087,8 +2142,8 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
   </div>
   <div class="tbl-wrap">
     <table>
-      <thead><tr><th>დრო</th><th>სახელი</th><th class="hide-m">მდებ.</th><th class="hide-m">★</th><th>შეტყობინება</th></tr></thead>
-      <tbody id="fb-tbody"><tr><td colspan="5" style="text-align:center;padding:2rem;opacity:.4">იტვირთება...</td></tr></tbody>
+      <thead><tr><th>დრო</th><th>სახელი</th><th>ელ-ფოსტა</th><th>შეტყობინება</th></tr></thead>
+      <tbody id="fb-tbody"><tr><td colspan="4" style="text-align:center;padding:2rem;opacity:.4">იტვირთება...</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -2120,10 +2175,6 @@ function getHeaders() {{
 }}
 
 // ── Toast ──────────────────────────────────────────────────────────────────
-function escapeHtml(s) {{
-  return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}}
-
 function toast(msg, ok) {{
   var c = document.getElementById('toast-container');
   var t = document.createElement('div');
@@ -2399,8 +2450,6 @@ async function loadSettings() {{
     setSlider('s-cw',        'chat_width_pct',   '%');
     setSlider('s-sc-chat',   'chat_scroll_px',   'px');
     setSlider('s-sc-reader', 'reader_scroll_px', 'px');
-    setSlider('s-rfont',     'reader_font_size', 'px');
-    setSlider('s-cfont',     'chat_font_size',   'px');
     var lang = document.getElementById('s-lang');
     if(lang && s.ui_lang_default) lang.value = s.ui_lang_default;
     var ann = document.getElementById('s-announce');
@@ -2426,14 +2475,20 @@ async function saveSettings() {{
     ['chat_width_pct',    document.getElementById('s-cw') ? document.getElementById('s-cw').value : '50'],
     ['chat_scroll_px',    document.getElementById('s-sc-chat').value],
     ['reader_scroll_px',  document.getElementById('s-sc-reader').value],
-    ['reader_font_size',  document.getElementById('s-rfont') ? document.getElementById('s-rfont').value : '16'],
-    ['chat_font_size',    document.getElementById('s-cfont') ? document.getElementById('s-cfont').value : '15'],
     ['ui_lang_default',  document.getElementById('s-lang').value],
     ['announcement_text', document.getElementById('s-announce') ? document.getElementById('s-announce').value : ''],
     ['usdt_address',      document.getElementById('s-usdt-addr')  ? document.getElementById('s-usdt-addr').value  : ''],
     ['usdt_qr_url',       document.getElementById('s-usdt-qr')    ? document.getElementById('s-usdt-qr').value    : ''],
     ['paddle_link_5',     document.getElementById('s-paddle5')    ? document.getElementById('s-paddle5').value    : ''],
     ['paddle_link_10',    document.getElementById('s-paddle10')   ? document.getElementById('s-paddle10').value   : ''],
+    ['reader_font_size',  document.getElementById('s-rfont')  ? document.getElementById('s-rfont').value  : '16'],
+    ['chat_font_size',    document.getElementById('s-cfont')  ? document.getElementById('s-cfont').value  : '15'],
+    ['quote_font_size',   document.getElementById('s-qfont')  ? document.getElementById('s-qfont').value  : '18'],
+    ['info_font_size',    document.getElementById('s-ifont')  ? document.getElementById('s-ifont').value  : '16'],
+    ['tablet_book_font',  document.getElementById('s-tbfont') ? document.getElementById('s-tbfont').value : '7'],
+    ['mobile_book_font',  document.getElementById('s-mbfont') ? document.getElementById('s-mbfont').value : '6'],
+    ['quote_font_family', document.getElementById('s-qfamily') ? document.getElementById('s-qfamily').value : 'fell'],
+    ['quote_font_style',  document.getElementById('s-qstyle-val') ? document.getElementById('s-qstyle-val').textContent : 'italic'],
   ];
   try {{
     var results = await Promise.all(pairs.map(function(p) {{
@@ -2449,6 +2504,13 @@ async function saveSettings() {{
       toast('✓ ყველა პარამეტრი შენახულია!', true);
     }}
   }} catch(e) {{ toast('შენახვა ვერ მოხერხდა: '+e.message, false); }}
+}}
+
+// ── Quote Style helper ──────────────────────────────────────────────────────
+function setQuoteStyle(style) {{
+  var el = document.getElementById('s-qstyle-val');
+  if(el) el.textContent = style;
+  toast('✓ Quote style: ' + style, true);
 }}
 
 // ── Chat Monitor ────────────────────────────────────────────────────────────
@@ -2473,19 +2535,17 @@ async function loadChats() {{
 async function loadFeedback() {{
   var tb = document.getElementById('fb-tbody');
   if(!tb) return;
-  tb.innerHTML='<tr><td colspan="5" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
+  tb.innerHTML='<tr><td colspan="4" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
   try {{
     var r = await fetch(API+'/admin/feedback?limit=50', {{headers:getHeaders()}});
     if(!r.ok) {{ toast('Feedback: '+r.status, false); return; }}
     var rows = await r.json();
-    if(!rows.length) {{ tb.innerHTML='<tr><td colspan="5" style="text-align:center;opacity:.4;padding:1.5rem">Feedback არ არის</td></tr>'; return; }}
+    if(!rows.length) {{ tb.innerHTML='<tr><td colspan="4" style="text-align:center;opacity:.4;padding:1.5rem">Feedback არ არის</td></tr>'; return; }}
     tb.innerHTML = rows.map(function(f){{
-      var prBadge = f.is_subscribed ? '<span style="color:#d4a017">★</span>' : '';
       return '<tr><td style="opacity:.45;white-space:nowrap;font-size:.78rem">'+f.at+'</td>'
-        +'<td style="font-size:.82rem">'+escapeHtml(f.name||'ანონ.')+'</td>'
-        +'<td class="hide-m" style="font-size:.75rem;opacity:.55">'+escapeHtml(f.location||'—')+'</td>'
-        +'<td class="hide-m" style="text-align:center">'+prBadge+'</td>'
-        +'<td style="font-size:.85rem;white-space:pre-wrap;max-width:380px">'+escapeHtml(f.message||'')+'</td></tr>';
+        +'<td style="font-size:.82rem">'+f.name+'</td>'
+        +'<td style="font-size:.78rem;opacity:.65">'+f.email+'</td>'
+        +'<td style="font-size:.85rem">'+f.message+'</td></tr>';
     }}).join('');
   }} catch(e) {{ toast('Error: '+e.message, false); }}
 }}
@@ -2519,12 +2579,11 @@ async def admin_feedback(limit: int = 50, admin: dict = Depends(require_admin)):
     """User feedback submissions."""
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, name, message, ip_address, location, is_subscribed, created_at FROM feedback ORDER BY created_at DESC LIMIT $1",
+            "SELECT id, name, email, message, created_at FROM feedback ORDER BY created_at DESC LIMIT $1",
             limit
         )
-    return [{"id": r["id"], "name": r["name"], "message": r["message"],
-             "location": r["location"] or "", "is_subscribed": r["is_subscribed"],
-             "at": r["created_at"].strftime("%Y-%m-%d %H:%M")} for r in rows]
+    return [{"id": r["id"], "name": r["name"], "email": r["email"],
+             "message": r["message"], "at": r["created_at"].strftime("%Y-%m-%d %H:%M")} for r in rows]
 
 
 # ── Homepage announcement banner ──────────────────────────────────────────
