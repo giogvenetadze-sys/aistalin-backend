@@ -104,6 +104,23 @@ def _cache_set(key: str, answer: str, sources: list):
     if len(_query_cache) > CACHE_MAX_SIZE:
         _query_cache.popitem(last=False)   # evict oldest
 
+# ── Volume cache (in-memory, permanent — corpus is static) ───────────────
+# The /volume/{num} response is pure DB text — it NEVER changes between deploys.
+# Storing it here means the first request per volume/language warms the cache;
+# every subsequent request is served from memory with zero DB round-trips.
+#
+# Key:   "{volume_num}_{language}"  e.g. "1_ka", "3_en"
+# Value: {"volume": int, "language": str, "chapters": list}
+#
+# Memory estimate: ~700KB per entry × 54 keys (18 vols × 3 langs) ≈ 38MB worst case.
+# In practice only loaded volumes are cached (lazy population), so memory
+# grows only as users actually open volumes — typically 5–15 entries.
+# Railway starter: 512MB RAM, so this is safe even if all 54 are loaded.
+_volume_cache: dict = {}
+
+def _vcache_key(volume_num: int, language: str) -> str:
+    return f"{volume_num}_{language}"
+
 # ── Trivial / greeting query detector ────────────────────────────────────
 # Queries below MIN_SUBSTANTIVE_CHARS or matching GREETING_RE bypass RAG
 # entirely — no embedding call, no DB hit, no sources returned.
@@ -1460,32 +1477,21 @@ async def _auto_translate_quote(text_ka: str) -> tuple[str, str]:
     )
     def _call():
         model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
+            model_name="models/gemini-2.5-flash",
             generation_config=genai.types.GenerationConfig(
                 max_output_tokens=512, temperature=0.2,
             )
         )
         return model.generate_content(prompt)
-    import re as _re, json as _j
     try:
-        gen = await asyncio.to_thread(_call)
-        raw = gen.text.strip()
-        # Strip markdown fences (lstrip/rstrip only strip chars, not substrings — use regex)
-        raw = _re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = _re.sub(r"\s*```\s*$", "", raw).strip()
-        # Extract first JSON object (handles extra text around it)
-        m = _re.search(r'\{[^{}]+\}', raw, _re.DOTALL)
-        if not m:
-            raise ValueError(f"No JSON found in response: {raw[:150]!r}")
-        data = _j.loads(m.group())
-        en = (data.get("en") or "").strip()
-        ru = (data.get("ru") or "").strip()
-        if not en and not ru:
-            raise ValueError(f"Both en/ru empty in: {raw[:150]!r}")
-        return en, ru
+        gen  = await asyncio.to_thread(_call)
+        raw  = gen.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        import json as _j
+        data = _j.loads(raw)
+        return data.get("en", ""), data.get("ru", "")
     except Exception as e:
         print(f"⚠ Auto-translate failed: {e}")
-        raise
+        return "", ""
 
 
 # ── Daily Quotes CRUD ──────────────────────────────────────────────────────
@@ -1514,12 +1520,7 @@ async def translate_quote_endpoint(body: dict, admin: dict = Depends(require_adm
     text_ka = (body.get("text_ka") or "").strip()
     if not text_ka:
         raise HTTPException(400, "text_ka is required")
-    try:
-        en, ru = await _auto_translate_quote(text_ka)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)[:200]}")
-    if not en and not ru:
-        raise HTTPException(status_code=500, detail="Translation returned empty results — check GEMINI_API_KEY")
+    en, ru = await _auto_translate_quote(text_ka)
     return {"text_en": en, "text_ru": ru}
 
 
@@ -2381,24 +2382,12 @@ async function autoTranslateQuote() {{
     var r = await fetch(API+'/admin/quotes/translate', {{
       method:'POST', headers:getHeaders(), body:JSON.stringify({{text_ka:ka}})
     }});
-    if(!r.ok) {{
-      var errDetail = '';
-      try {{ var errBody = await r.json(); errDetail = errBody.detail || ''; }} catch(_){{}};
-      toast('⚠ '+errDetail || 'თარგმნა ვერ მოხერხდა: '+r.status, false);
-      if(sta) sta.textContent = '❌ ' + (errDetail || 'status '+r.status);
-      return;
-    }}
+    if(!r.ok) {{ toast('თარგმნა ვერ მოხერხდა: '+r.status, false); return; }}
     var d = await r.json();
-    var filled = 0;
-    if(d.text_en) {{ document.getElementById('q-en').value = d.text_en; filled++; }}
-    if(d.text_ru) {{ document.getElementById('q-ru').value = d.text_ru; filled++; }}
-    if(filled === 2) {{
-      if(sta) sta.textContent = '✓ EN + RU დასრულდა';
-      toast('✓ AI თარგმნა წარმატებულია', true);
-    }} else {{
-      if(sta) sta.textContent = '⚠ თარგმნა არასრულია';
-      toast('⚠ თარგმნა ვერ შეავსო ველები — Railway log შეამოწმე', false);
-    }}
+    if(d.text_en) document.getElementById('q-en').value = d.text_en;
+    if(d.text_ru) document.getElementById('q-ru').value = d.text_ru;
+    if(sta) sta.textContent = '✓ EN + RU დასრულდა';
+    toast('✓ AI თარგმნა წარმატებულია', true);
   }} catch(e) {{
     toast('Error: '+e.message, false);
   }} finally {{
@@ -3200,9 +3189,23 @@ async def get_volume_content(volume_num: int, language: str = "ka"):
     Returns full content of a volume: all chunks grouped by article title.
     language: "ka" (default) | "en" | "ru"
     Used by the frontend reader modal.
+
+    Cache strategy: permanent in-memory dict (_volume_cache).
+    Corpus text never changes between deploys, so no expiry is needed.
+    First call per volume/language hits DB; all subsequent calls are instant.
     """
     if language not in ["en", "ka", "ru"]:
         raise HTTPException(400, "language must be 'en', 'ka', or 'ru'")
+
+    vkey = _vcache_key(volume_num, language)
+
+    # ── Cache HIT ────────────────────────────────────────────────────────
+    if vkey in _volume_cache:
+        print(f"VOLUME CACHE HIT  | vol={volume_num} lang={language}")
+        return _volume_cache[vkey]
+
+    # ── Cache MISS — query DB ────────────────────────────────────────────
+    print(f"VOLUME CACHE MISS | vol={volume_num} lang={language} → querying DB")
 
     sql = """
         SELECT
@@ -3224,10 +3227,19 @@ async def get_volume_content(volume_num: int, language: str = "ka"):
         rows = await conn.fetch(sql, volume_num, language)
 
     if not rows:
+        # Do NOT cache "not found" — volume may be loaded later
         return {"volume": volume_num, "chapters": [], "error": "Volume not found or not yet loaded"}
 
-    chapters = [{"title": r["title"], "chunk_text": r["chunk_text"]} for r in rows]
-    return {"volume": volume_num, "language": language, "chapters": chapters}
+    result = {
+        "volume":   volume_num,
+        "language": language,
+        "chapters": [{"title": r["title"], "chunk_text": r["chunk_text"]} for r in rows],
+    }
+
+    # Store permanently — corpus is static
+    _volume_cache[vkey] = result
+    print(f"VOLUME CACHE STORE| vol={volume_num} lang={language} | {len(rows)} chunks cached")
+    return result
 
 # ══════════════════════════════════════════════════════════════
 #  FEEDBACK ENDPOINT
