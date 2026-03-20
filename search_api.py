@@ -2,6 +2,13 @@
 # v2.0: JWT auth, HttpOnly session tokens, velocity check, daily limits
 # v40:  fix translation bug (response_mime_type for Gemini 2.5 Flash),
 #       add in-memory system log buffer + /admin/logs endpoint + Logs panel
+# v41:  security hardening — query length limits (QueryStr max=1000),
+#       JWT_SECRET startup guard, CORS whitelist from ALLOWED_ORIGINS env,
+#       SecurityHeadersMiddleware (X-Frame-Options, nosniff, Referrer-Policy),
+#       get_real_ip() Railway-aware IP helper (last X-Forwarded-For hop),
+#       login brute-force protection (10 fails / 15 min window),
+#       PADDLE_CLIENT_TOKEN via env + /settings/public injection,
+#       exception detail leak fix in translation endpoint
 # SYSTEM_INSTRUCTION, _generate(), RAG logic -- UNTOUCHED
 
 import os, asyncio, asyncpg, uuid, datetime, secrets, hashlib, hmac, time
@@ -13,9 +20,9 @@ from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from dotenv import load_dotenv
-from typing import Optional
+from typing import Optional, Annotated
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -26,7 +33,9 @@ load_dotenv()
 
 DATABASE_URL    = os.getenv("DATABASE_URL")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY")
-JWT_SECRET      = os.getenv("JWT_SECRET", "change-this-in-production")
+JWT_SECRET      = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    raise RuntimeError("FATAL: JWT_SECRET env var is not set. App cannot start safely.")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")  # Get from Google Cloud Console → APIs & Services → Credentials
 
 # ── Paddle configuration ─────────────────────────────────────────────────────
@@ -34,6 +43,7 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")  # Get from Google Cloud Co
 PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "")  # Notification secret key
 PADDLE_PRICE_ID       = os.getenv("PADDLE_PRICE_ID", "")        # pri_xxxx — your $5/mo price
 PADDLE_ENV            = os.getenv("PADDLE_ENV", "sandbox")       # "sandbox" | "production"
+PADDLE_CLIENT_TOKEN   = os.getenv("PADDLE_CLIENT_TOKEN", "")    # live_xxx or test_xxx — client-side token for Paddle.js
 
 # ── Admin access ─────────────────────────────────────────────────────────────
 # Only this email can access future admin endpoints (e.g. /admin/*)
@@ -278,6 +288,23 @@ SMTP_PASS    = os.getenv("SMTP_PASS", "")
 NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "contact@aistalin.io")
 
 # ── Password hashing — direct bcrypt (rounds=12, work factor) ────────────
+# ── IP extraction (Railway-aware) ─────────────────────────────────────────────
+def get_real_ip(request: Request) -> str:
+    """Return the real client IP from X-Forwarded-For.
+
+    Railway prepends its own hop LAST in X-Forwarded-For, which is the only
+    trusted entry. The client controls all earlier hops — never use split[0]
+    for rate limiting (trivially spoofed).
+
+    Falls back to request.client.host when the header is absent (local dev).
+    """
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        ips = [ip.strip() for ip in xff.split(",")]
+        return ips[-1]   # Railway's trusted hop
+    return request.client.host or "Unknown"
+
+
 def _hash_password(password: str) -> str:
     """Hash a password with bcrypt. Input validated to ≤72 bytes before call."""
     salt = _bcrypt.gensalt(rounds=12)
@@ -291,14 +318,31 @@ def _verify_password(plain: str, hashed: str) -> bool:
         return False
 bearer_scheme = HTTPBearer(auto_error=False)
 
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://aistalin.io,https://www.aistalin.io"
+).split(",")
+
 app = FastAPI(title="AiStalin Hybrid Search API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],                       # ✅ works everywhere (HTTP+HTTPS)
-    allow_methods=["*"],
-    allow_headers=["*", "X-Session-Token"],    # allow custom session header
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Session-Token"],
     expose_headers=["X-Session-Token"],        # frontend can read this from response
 )
+from starlette.middleware.base import BaseHTTPMiddleware
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
 db_pool: asyncpg.Pool = None
 
 
@@ -523,7 +567,7 @@ async def register(req: RegisterRequest, request: Request):
             "Password too long — use Latin characters (bcrypt max = 72 bytes; Georgian chars = 3 bytes each)"
         )
     pw_hash = _hash_password(req.password)
-    ip = request.headers.get("X-Forwarded-For", request.client.host or "Unknown").split(",")[0].strip()
+    ip = get_real_ip(request)
     try:
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -535,14 +579,35 @@ async def register(req: RegisterRequest, request: Request):
     return {"access_token": create_jwt(row["id"],row["email"],row["role"],row["is_premium"]),
             "token_type": "bearer"}
 
+# ── Brute-force protection for /login ─────────────────────────────────────────
+import collections
+_login_fails: dict = collections.defaultdict(list)  # ip → [unix timestamps]
+_LOGIN_MAX_FAILS   = 10
+_LOGIN_WINDOW_SEC  = 900  # 15 minutes
+
+def _check_login_rate(ip: str) -> None:
+    """Raise 429 if this IP has exceeded failed-login threshold in the window."""
+    now = time.time()
+    recent = [t for t in _login_fails[ip] if now - t < _LOGIN_WINDOW_SEC]
+    _login_fails[ip] = recent  # prune old entries
+    if len(recent) >= _LOGIN_MAX_FAILS:
+        raise HTTPException(429, "Too many failed attempts. Try again in 15 minutes.")
+
+def _record_login_fail(ip: str) -> None:
+    _login_fails[ip].append(time.time())
+
+
 @app.post("/login")
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
+    client_ip = get_real_ip(request)
+    _check_login_rate(client_ip)          # block before DB touch if already locked
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id,email,password_hash,role,is_premium,premium_until FROM users WHERE email=$1",
             req.email.lower()
         )
     if not row or not _verify_password(req.password, row["password_hash"]):
+        _record_login_fail(client_ip)     # count the failure
         raise HTTPException(401, "Invalid email or password")
     is_premium = row["is_premium"]
     if is_premium and row["premium_until"]:
@@ -597,9 +662,7 @@ async def auth_google(req: GoogleAuthRequest, request: Request):
 
         if row is None:
             # New user — insert with google_sso placeholder password
-            ip = request.headers.get(
-                "X-Forwarded-For", request.client.host or "Unknown"
-            ).split(",")[0].strip()
+            ip = get_real_ip(request)
             row = await conn.fetchrow(
                 "INSERT INTO users (email, password_hash, ip_address) "
                 "VALUES ($1, 'google_sso', $2) "
@@ -1572,7 +1635,11 @@ async def get_public_settings():
     """
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT key, value FROM site_settings ORDER BY key")
-    return {r["key"]: r["value"] for r in rows}
+    settings = {r["key"]: r["value"] for r in rows}
+    # Inject server-side secrets so they never need to be hardcoded in frontend HTML
+    if PADDLE_CLIENT_TOKEN:
+        settings["paddle_client_token"] = PADDLE_CLIENT_TOKEN
+    return settings
 
 
 # ── Daily Quote auto-translation via Gemini Flash ────────────────────────────
@@ -1668,7 +1735,8 @@ async def translate_quote_endpoint(body: dict, admin: dict = Depends(require_adm
     try:
         en, ru = await _auto_translate_quote(text_ka)
     except Exception as e:
-        raise HTTPException(500, f"Translation failed: {e}")
+        print(f"⚠ Translation error: {e}")   # internal log only
+        raise HTTPException(500, "Translation service temporarily unavailable")
     return {"text_en": en, "text_ru": ru}
 
 
@@ -2935,8 +3003,10 @@ async def clear_admin_logs(admin: dict = Depends(require_admin)):
 # Frontend reads /settings/public and shows if non-empty
 
 # == SEARCH MODELS ===========================================================
+QueryStr = Annotated[str, Field(min_length=1, max_length=1000)]
+
 class SearchRequest(BaseModel):
-    query: str; language: str = "en"; top_k: int = TOP_K; mode: str = "hybrid"
+    query: QueryStr; language: str = "en"; top_k: int = TOP_K; mode: str = "hybrid"
 
 class ChunkResult(BaseModel):
     chunk_id: int; work_id: int; title: str; chunk_text: str
@@ -3032,7 +3102,7 @@ async def search(req: SearchRequest):
 
 # == CHAT MODELS ============================================================
 class ChatRequest(BaseModel):
-    query: str
+    query: QueryStr
     language: str = 'ka'   # default to Georgian (site primary language)
     top_k: int = CHAT_TOP_K  # default 4; frontend can override if needed
 
@@ -3423,7 +3493,7 @@ async def chat(
         session_token = str(uuid.uuid4())
 
     # 2. Client IP
-    client_ip = request.headers.get("X-Forwarded-For", request.client.host or "Unknown").split(",")[0].strip()
+    client_ip = get_real_ip(request)
 
     # 3. Velocity check
     async with db_pool.acquire() as conn:
