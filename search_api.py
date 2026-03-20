@@ -77,8 +77,14 @@ CACHE_MAX_SIZE = 256
 _query_cache: _OD = _OD()   # key → {"answer": str, "sources": list, "ts": float}
 
 def _cache_key(query: str, language: str) -> str:
-    """Normalise query to maximise cache hits for near-identical inputs."""
-    return language + ":" + _re.sub(r"\s+", " ", query.strip().lower())
+    """Normalise query to maximise cache hits for near-identical inputs.
+    Steps: lowercase → collapse whitespace → strip trailing punctuation.
+    'სტალინი?' and 'სტალინი' now share the same cache entry.
+    """
+    q = query.strip().lower()
+    q = _re.sub(r"\s+", " ", q)          # collapse internal whitespace
+    q = _re.sub(r"[?!.,;:]+$", "", q)    # strip trailing punctuation
+    return language + ":" + q
 
 def _cache_get(key: str):
     entry = _query_cache.get(key)
@@ -575,8 +581,6 @@ def _resend_post(from_addr: str, to_email: str, subject: str, html_body: str) ->
 
 
 def _send_reset_email(to_email: str, reset_link: str):
-    print("🔥 USING RESEND_API_KEY:", RESEND_API_KEY[:10])
-    print("🔥 USING FROM:", RESEND_FROM)
     """Send password reset email via Resend HTTP API.
     Strategy:
       1. Try RESEND_FROM (custom domain, e.g. noreply@aistalin.io)
@@ -2986,15 +2990,25 @@ async def chat(
         ).dict())
 
     # ── Cache lookup ──────────────────────────────────────────────────────
-    # Identical query+language within 6 hours returns instantly.
+    # Safety rules (applied before every read AND write):
+    #   1. Skip entirely for premium users — their prompt includes personal memory
+    #      context injected from chat_history. Caching that would pollute free-user
+    #      responses with another user's conversation context (data leak).
+    #   2. Skip for very short queries (< 5 chars) — too ambiguous to cache safely.
+    # For free users with substantive queries: cache returns instantly (6h TTL).
     _ck = _cache_key(req.query, req.language)
-    _cached = _cache_get(_ck)
-    if _cached:
-        return JSONResponse(content=ChatResponse(
-            query=req.query,
-            answer=_cached["answer"],
-            sources=[SourceItem(**s) for s in _cached["sources"]]
-        ).dict())
+    _is_premium_user = bool(current_user and current_user.get("is_premium"))
+    _query_is_cacheable = len(req.query.strip()) >= 5 and not _is_premium_user
+
+    if _query_is_cacheable:
+        _cached = _cache_get(_ck)
+        if _cached:
+            print(f"CACHE HIT | lang={req.language} | key={_ck[:60]}")
+            return JSONResponse(content=ChatResponse(
+                query=req.query,
+                answer=_cached["answer"],
+                sources=[SourceItem(**s) for s in _cached["sources"]]
+            ).dict())
 
     # 1. Session token — header takes priority (works on HTTP+HTTPS)
     #    Frontend stores it in localStorage and sends as X-Session-Token
@@ -3132,9 +3146,21 @@ async def chat(
 
     data = ChatResponse(query=req.query, answer=answer, sources=sources)
 
-    # Write to cache — only substantive answers (not "not found")
-    if not info_not_found:
+    # ── Cache write ───────────────────────────────────────────────────────
+    # Structural safety checks (more reliable than string matching alone):
+    #   - _query_is_cacheable: not premium + query long enough (set above)
+    #   - info_not_found: explicit "not found" branch OR string-matched phrases
+    #   - sources empty when top_score was above threshold: suspicious — skip
+    # This prevents caching: premium memory responses, "not found" answers,
+    # clarifying questions, and low-quality retrievals.
+    _no_info = (not chunks) or info_not_found
+    if _query_is_cacheable and not _no_info:
         _cache_set(_ck, answer, [s.dict() for s in sources])
+        print(f"CACHE STORE | lang={req.language} | key={_ck[:60]}")
+    elif not _query_is_cacheable:
+        print(f"CACHE SKIP (premium or short) | lang={req.language}")
+    else:
+        print(f"CACHE MISS+SKIP (no-info answer) | lang={req.language}")
 
     return _attach_session(JSONResponse(content=data.dict()))
 
