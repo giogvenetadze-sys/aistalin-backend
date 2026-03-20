@@ -60,12 +60,12 @@ EMBED_MODEL      = "models/gemini-embedding-001"
 TOP_K            = 10
 RRF_K            = 60
 VELOCITY_SECONDS = int(os.getenv("VELOCITY_SECONDS", "5"))
-FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "3"))
+FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "5"))
 
 # ── Chat RAG constants (single source of truth) ───────────────────────────
 # Change these two lines only — no other edits needed to tune chat quality.
 CHAT_TOP_K          = 4   # fused chunks passed to generation (was 5)
-CHAT_SOURCE_LIMIT   = 3   # max sources returned in response
+CHAT_SOURCE_LIMIT   = 5   # max sources returned in response
 PREMIUM_MEMORY_DAYS = 10  # how far back to look for premium chat history
 PREMIUM_MEMORY_TURNS = 5  # max turns injected directly into prompt
 
