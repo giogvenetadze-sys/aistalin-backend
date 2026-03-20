@@ -1,3 +1,4 @@
+
 # search_api.py -- AiStalin Hybrid Search API v2.0.0
 # v2.0: JWT auth, HttpOnly session tokens, velocity check, daily limits
 # v40:  fix translation bug (response_mime_type for Gemini 2.5 Flash),
@@ -814,25 +815,15 @@ def _send_reset_email(to_email: str, reset_link: str):
 
     subject = "AiStalin — პაროლის განახლება"
 
-    # Attempt 1: Try configured RESEND_FROM (custom domain noreply@aistalin.io)
+    # Send via configured RESEND_FROM (noreply@aistalin.io)
     try:
         result = _resend_post(RESEND_FROM, to_email, subject, html_body)
         print(f"✅ Email sent ({RESEND_FROM}) → {to_email} | id: {result.get('id')}")
         return
     except urllib.error.HTTPError as e:
         raw = e.read().decode()
-        # Error 1010 = "from" domain not verified for this API key scope
-        # Auto-fallback to Resend built-in test address — works with ANY valid key
-        if e.code == 403 and "1010" in raw:
-            print(f"⚠ 1010: domain not authorized for this key → fallback to onboarding@resend.dev")
-            try:
-                result = _resend_post("onboarding@resend.dev", to_email, subject, html_body)
-                print(f"✅ Email sent (onboarding@resend.dev) → {to_email} | id: {result.get('id')}")
-                return
-            except Exception as e2:
-                print(f"⚠ Fallback failed: {e2}")
-        else:
-            print(f"⚠ Resend error {e.code}: {raw}")
+        print(f"⚠ Resend error {e.code}: {raw}")
+        print(f"⚠ RESEND_FROM={RESEND_FROM} | key_prefix={RESEND_API_KEY[:8] if RESEND_API_KEY else 'MISSING'}")
     except Exception as e:
         print(f"⚠ Email failed: {type(e).__name__}: {e}")
 
