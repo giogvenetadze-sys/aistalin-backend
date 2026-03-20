@@ -1460,7 +1460,7 @@ async def _auto_translate_quote(text_ka: str) -> tuple[str, str]:
     )
     def _call():
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-2.5-flash",
             generation_config=genai.types.GenerationConfig(
                 max_output_tokens=512, temperature=0.2,
             )
