@@ -1,5 +1,7 @@
 # search_api.py -- AiStalin Hybrid Search API v2.0.0
 # v2.0: JWT auth, HttpOnly session tokens, velocity check, daily limits
+# v40:  fix translation bug (response_mime_type for Gemini 2.5 Flash),
+#       add in-memory system log buffer + /admin/logs endpoint + Logs panel
 # SYSTEM_INSTRUCTION, _generate(), RAG logic -- UNTOUCHED
 
 import os, asyncio, asyncpg, uuid, datetime, secrets, hashlib, hmac, time
@@ -103,6 +105,29 @@ def _cache_set(key: str, answer: str, sources: list):
     _query_cache[key] = {"answer": answer, "sources": sources, "ts": time.time()}
     if len(_query_cache) > CACHE_MAX_SIZE:
         _query_cache.popitem(last=False)   # evict oldest
+
+
+# ── In-memory log buffer (admin "System Events" panel) ───────────────────
+# Circular buffer of the last 400 system events.
+# Cleared on Railway restart (intentional — ephemeral debug log).
+# Events: TRANSLATE | CACHE | SEARCH | AUTH | RATE_LIMIT | SYSTEM | ERROR
+from collections import deque as _deque
+import threading as _threading
+
+_LOG_BUFFER: _deque = _deque(maxlen=400)
+_log_lock = _threading.Lock()
+
+def _alog(level: str, event: str, msg: str):
+    """Append a structured event to the in-memory log buffer AND print to Railway stdout.
+    level : INFO | WARN | ERROR
+    event : TRANSLATE | CACHE | SEARCH | AUTH | RATE_LIMIT | SYSTEM | ERROR
+    """
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    entry = {"ts": ts, "level": level, "event": event, "msg": msg}
+    with _log_lock:
+        _LOG_BUFFER.append(entry)
+    icon = {"INFO": "ℹ️", "WARN": "⚠️", "ERROR": "❌"}.get(level, "•")
+    print(f"{icon} [{event}] {msg}")
 
 # ── Volume cache (in-memory, permanent — corpus is static) ───────────────
 # The /volume/{num} response is pure DB text — it NEVER changes between deploys.
@@ -1553,34 +1578,62 @@ async def get_public_settings():
 # ── Daily Quote auto-translation via Gemini Flash ────────────────────────────
 async def _auto_translate_quote(text_ka: str) -> tuple[str, str]:
     """Translate Georgian Stalin quote → EN + RU using Gemini Flash.
-    Returns (text_en, text_ru). Falls back to ("","") on any error."""
+
+    Uses response_mime_type='application/json' to guarantee clean JSON output.
+    CRITICAL for Gemini 2.5 Flash (thinking model) — without this it may emit
+    reasoning text before the JSON, breaking all string-based parsing attempts.
+
+    Returns (text_en, text_ru).
+    Raises ValueError/Exception on failure — callers should catch and return HTTP 500.
+    """
     prompt = (
         "You are a professional translator specialising in Soviet-era political texts.\n"
         "Translate the following Georgian quote attributed to Joseph Stalin "
-        "into English and Russian.\n\n"
-        "Rules:\n"
-        "- Preserve the original rhetorical register (disciplined, declarative, political)\n"
-        "- Do NOT add quotation marks, annotations, or preamble\n"
-        "- Output ONLY valid JSON: {\"en\": \"<English>\", \"ru\": \"<Russian>\"}\n\n"
+        "into English and Russian.\n"
+        "Preserve the original rhetorical register: disciplined, declarative, political.\n"
+        "Do NOT add quotation marks, annotations, or explanatory text.\n\n"
         f"Georgian original:\n{text_ka}"
     )
+
     def _call():
         model = genai.GenerativeModel(
             model_name="models/gemini-2.5-flash",
             generation_config=genai.types.GenerationConfig(
-                max_output_tokens=512, temperature=0.2,
+                max_output_tokens=512,
+                temperature=0.1,
+                response_mime_type="application/json",   # forces pure JSON — no markdown fences
+                response_schema={                         # guarantees key names en + ru
+                    "type": "object",
+                    "properties": {
+                        "en": {"type": "string"},
+                        "ru": {"type": "string"},
+                    },
+                    "required": ["en", "ru"],
+                },
             )
         )
         return model.generate_content(prompt)
+
+    import json as _j
     try:
-        gen  = await asyncio.to_thread(_call)
-        raw  = gen.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-        import json as _j
+        gen = await asyncio.to_thread(_call)
+        raw = gen.text.strip()
+        # Defensive strip: remove markdown fences IF somehow still present
+        # (should never happen with response_mime_type, but belt-and-suspenders)
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            inner = [l for l in lines if not l.strip().startswith("```")]
+            raw = "\n".join(inner).strip()
         data = _j.loads(raw)
-        return data.get("en", ""), data.get("ru", "")
+        en = (data.get("en") or "").strip()
+        ru = (data.get("ru") or "").strip()
+        if not en or not ru:
+            raise ValueError(f"Gemini returned empty translation: en={repr(en)} ru={repr(ru)}")
+        _alog("INFO", "TRANSLATE", f"OK | {text_ka[:50]!r} → en={en[:40]!r}")
+        return en, ru
     except Exception as e:
-        print(f"⚠ Auto-translate failed: {e}")
-        return "", ""
+        _alog("ERROR", "TRANSLATE", f"FAILED: {type(e).__name__}: {e}")
+        raise
 
 
 # ── Daily Quotes CRUD ──────────────────────────────────────────────────────
@@ -1605,11 +1658,17 @@ class QuoteCreate(BaseModel):
 
 @app.post("/admin/quotes/translate")
 async def translate_quote_endpoint(body: dict, admin: dict = Depends(require_admin)):
-    """Standalone translate: {"text_ka":"..."} → {"text_en":"...","text_ru":"..."}"""
+    """Standalone translate: {"text_ka":"..."} → {"text_en":"...","text_ru":"..."}
+    Returns HTTP 500 with detail message if Gemini fails — so the frontend
+    can show a real error toast instead of silently filling nothing.
+    """
     text_ka = (body.get("text_ka") or "").strip()
     if not text_ka:
         raise HTTPException(400, "text_ka is required")
-    en, ru = await _auto_translate_quote(text_ka)
+    try:
+        en, ru = await _auto_translate_quote(text_ka)
+    except Exception as e:
+        raise HTTPException(500, f"Translation failed: {e}")
     return {"text_en": en, "text_ru": ru}
 
 
@@ -1937,6 +1996,7 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
   <button class="nav-item" onclick="show('settings',this)"><i class="fa fa-sliders"></i>პარამეტრები</button>
   <button class="nav-item" onclick="show('chats',this)"><i class="fa fa-message"></i>ჩათ მონიტორი</button>
   <button class="nav-item" onclick="show('feedback',this)"><i class="fa fa-inbox"></i>Feedback</button>
+  <button class="nav-item" onclick="show('logs',this)"><i class="fa fa-terminal"></i>System Logs</button>
   <div class="sidebar-foot"><a href="https://aistalin.io" style="color:inherit;text-decoration:none;">← aistalin.io</a></div>
 </aside>
 <main class="main">
@@ -2260,6 +2320,64 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
   </div>
 </div>
 
+<!-- SYSTEM LOGS -->
+<div id="sec-logs" class="section">
+  <div class="page-title">System Events Log</div>
+
+  <!-- Controls bar -->
+  <div class="search-row" style="margin-bottom:1rem;flex-wrap:wrap;gap:.5rem">
+    <select id="log-level-filter" onchange="loadLogs()" style="min-width:110px">
+      <option value="ALL">ყველა დონე</option>
+      <option value="INFO">INFO</option>
+      <option value="WARN">WARN</option>
+      <option value="ERROR">ERROR</option>
+    </select>
+    <select id="log-event-filter" onchange="loadLogs()" style="min-width:130px">
+      <option value="ALL">ყველა ტიპი</option>
+      <option value="TRANSLATE">TRANSLATE</option>
+      <option value="CACHE">CACHE</option>
+      <option value="SEARCH">SEARCH</option>
+      <option value="AUTH">AUTH</option>
+      <option value="RATE_LIMIT">RATE_LIMIT</option>
+      <option value="ERROR">ERROR</option>
+      <option value="SYSTEM">SYSTEM</option>
+    </select>
+    <button class="btn btn-ghost btn-sm" onclick="loadLogs()">
+      <i class="fa fa-refresh"></i> განახლება
+    </button>
+    <label style="display:flex;align-items:center;gap:.4rem;font-size:.8rem;cursor:pointer;padding:0;margin:0">
+      <input type="checkbox" id="log-autorefresh" style="accent-color:var(--gold)"
+             onchange="toggleLogAutoRefresh()">
+      Auto (5s)
+    </label>
+    <button class="btn btn-sm btn-red" onclick="clearLogs()" style="margin-left:auto">
+      <i class="fa fa-trash"></i> გასუფთავება
+    </button>
+  </div>
+
+  <!-- Info bar -->
+  <div id="log-info" style="font-size:.72rem;opacity:.4;margin-bottom:.5rem"></div>
+
+  <!-- Log table -->
+  <div class="tbl-wrap" style="max-height:70vh;overflow-y:auto">
+    <table id="log-table">
+      <thead>
+        <tr>
+          <th style="width:7.5rem">დრო (UTC)</th>
+          <th style="width:3.5rem">Level</th>
+          <th style="width:6rem">Event</th>
+          <th>შეტყობინება</th>
+        </tr>
+      </thead>
+      <tbody id="log-tbody">
+        <tr><td colspan="4" style="text-align:center;padding:2rem;opacity:.4">
+          "System Logs"-ს დააჭირეთ ან გამოიყენეთ "განახლება" ღილაკი
+        </td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
 </main></div>
 
 <script>
@@ -2302,10 +2420,13 @@ function show(sec, btn) {{
   document.querySelectorAll('.nav-item').forEach(function(b){{b.classList.remove('active')}});
   document.getElementById('sec-'+sec).classList.add('active');
   btn.classList.add('active');
-  if(sec==='dash') loadStats();
-  if(sec==='users') loadUsers();
-  if(sec==='quotes') loadQuotes();
+  if(sec==='dash')     loadStats();
+  if(sec==='users')    loadUsers();
+  if(sec==='quotes')   loadQuotes();
   if(sec==='settings') loadSettings();
+  if(sec==='chats')    loadChats();
+  if(sec==='feedback') loadFeedback();
+  if(sec==='logs')     loadLogs();
 }}
 
 // ── Stats ──────────────────────────────────────────────────────────────────
@@ -2465,20 +2586,32 @@ async function autoTranslateQuote() {{
   var lbl = document.getElementById('q-translate-label');
   var sta = document.getElementById('q-translate-status');
   if(btn) btn.disabled = true;
-  if(lbl) lbl.textContent = 'ითარგმნება...';
+  if(lbl) lbl.textContent = '⏳ ითარგმნება...';
   if(sta) sta.textContent = '';
   try {{
     var r = await fetch(API+'/admin/quotes/translate', {{
       method:'POST', headers:getHeaders(), body:JSON.stringify({{text_ka:ka}})
     }});
-    if(!r.ok) {{ toast('თარგმნა ვერ მოხერხდა: '+r.status, false); return; }}
     var d = await r.json();
-    if(d.text_en) document.getElementById('q-en').value = d.text_en;
-    if(d.text_ru) document.getElementById('q-ru').value = d.text_ru;
-    if(sta) sta.textContent = '✓ EN + RU დასრულდა';
-    toast('✓ AI თარგმნა წარმატებულია', true);
+    if(!r.ok) {{
+      var errMsg = (d && d.detail) ? d.detail : 'HTTP ' + r.status;
+      toast('⚠ თარგმნა ვერ მოხერხდა: ' + errMsg, false);
+      if(sta) sta.textContent = '✗ შეცდომა';
+      return;
+    }}
+    // Always assign — even empty string clears a stale previous value
+    document.getElementById('q-en').value = d.text_en || '';
+    document.getElementById('q-ru').value = d.text_ru || '';
+    if(!d.text_en && !d.text_ru) {{
+      toast('⚠ AI-მ ცარიელი თარგმანი დააბრუნა', false);
+      if(sta) sta.textContent = '✗ ცარიელი პასუხი';
+    }} else {{
+      if(sta) sta.textContent = '✓ EN + RU დასრულდა';
+      toast('✓ AI თარგმნა წარმატებულია', true);
+    }}
   }} catch(e) {{
-    toast('Error: '+e.message, false);
+    toast('⚠ კავშირის შეცდომა: '+e.message, false);
+    if(sta) sta.textContent = '✗ შეცდომა';
   }} finally {{
     if(btn) btn.disabled = false;
     if(lbl) lbl.textContent = '🤖 AI ავტო-თარგმნა (EN + RU)';
@@ -2662,6 +2795,67 @@ async function loadFeedback() {{
   }} catch(e) {{ toast('Error: '+e.message, false); }}
 }}
 
+// ── System Logs ──────────────────────────────────────────────────────────────
+var _logRefreshTimer = null;
+
+async function loadLogs() {{
+  var tb    = document.getElementById('log-tbody');
+  var info  = document.getElementById('log-info');
+  var level = (document.getElementById('log-level-filter') || {{}}).value || 'ALL';
+  var event = (document.getElementById('log-event-filter') || {{}}).value || 'ALL';
+  if(!tb) return;
+  try {{
+    var url = API+'/admin/logs?limit=200&level='+encodeURIComponent(level)+'&event='+encodeURIComponent(event);
+    var r = await fetch(url, {{headers:getHeaders()}});
+    if(!r.ok) {{ toast('Logs: '+r.status, false); return; }}
+    var d = await r.json();
+    if(info) info.textContent = 'Buffer-ში სულ: '+d.total_in_buffer+' event | ნაჩვენებია: '+d.returned;
+    if(!d.entries || !d.entries.length) {{
+      tb.innerHTML='<tr><td colspan="4" style="text-align:center;padding:2rem;opacity:.4">' +
+        'Events არ არის (buffer ცარიელია ან ფილტრი ზედმეტად ვიწრო)</td></tr>';
+      return;
+    }}
+    var evtColors = {{
+      'TRANSLATE':'#ce93d8', 'CACHE':'#80cbc4', 'SEARCH':'#90caf9',
+      'AUTH':'#f48fb1', 'ERROR':'#ef9a9a', 'RATE_LIMIT':'#ffcc80', 'SYSTEM':'#bcaaa4'
+    }};
+    tb.innerHTML = d.entries.map(function(e) {{
+      var lvlStyle = e.level==='ERROR' ? 'color:#ef9a9a' : e.level==='WARN' ? 'color:#ffcc80' : 'color:#a5d6a7';
+      var evtColor = evtColors[e.event] || 'var(--cream2)';
+      return '<tr>'
+        + '<td style="font-family:monospace;font-size:.75rem;opacity:.55;white-space:nowrap">'+e.ts+'</td>'
+        + '<td style="'+lvlStyle+';font-size:.72rem;font-weight:600">'+e.level+'</td>'
+        + '<td style="color:'+evtColor+';font-size:.75rem;font-weight:500">'+e.event+'</td>'
+        + '<td style="font-family:monospace;font-size:.78rem;word-break:break-all">'
+          + e.msg.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+          + '</td>'
+        + '</tr>';
+    }}).join('');
+  }} catch(ex) {{ toast('Logs load error: '+ex.message, false); }}
+}}
+
+async function clearLogs() {{
+  if(!confirm('Log buffer გაიწმინდება. გაგრძელება?')) return;
+  try {{
+    var r = await fetch(API+'/admin/logs', {{method:'DELETE', headers:getHeaders()}});
+    if(!r.ok) {{ toast('Clear failed: '+r.status, false); return; }}
+    toast('✓ Log buffer გასუფთავდა', true);
+    loadLogs();
+  }} catch(ex) {{ toast('Error: '+ex.message, false); }}
+}}
+
+function toggleLogAutoRefresh() {{
+  var cb = document.getElementById('log-autorefresh');
+  if(!cb) return;
+  if(cb.checked) {{
+    _logRefreshTimer = setInterval(loadLogs, 5000);
+    toast('Auto-refresh ჩაირთო (5s)', true);
+  }} else {{
+    clearInterval(_logRefreshTimer);
+    _logRefreshTimer = null;
+  }}
+}}
+
 // ── Init ────────────────────────────────────────────────────────────────────
 loadStats();
 </script>
@@ -2696,6 +2890,44 @@ async def admin_feedback(limit: int = 50, admin: dict = Depends(require_admin)):
         )
     return [{"id": r["id"], "name": r["name"], "email": r["email"],
              "message": r["message"], "at": r["created_at"].strftime("%Y-%m-%d %H:%M")} for r in rows]
+
+
+# ── System event log (admin) ───────────────────────────────────────────────
+@app.get("/admin/logs")
+async def admin_logs(
+    limit: int = 200,
+    level: str = "ALL",
+    event: str = "ALL",
+    admin: dict = Depends(require_admin),
+):
+    """
+    Returns in-memory system event log (newest first).
+    Filters: level=INFO|WARN|ERROR|ALL, event=TRANSLATE|CACHE|SEARCH|AUTH|SYSTEM|ALL
+    Buffer is ephemeral — cleared on Railway restart.
+    """
+    with _log_lock:
+        entries = list(_LOG_BUFFER)
+        total_in_buffer = len(_LOG_BUFFER)
+
+    if level != "ALL":
+        entries = [e for e in entries if e["level"] == level]
+    if event != "ALL":
+        entries = [e for e in entries if e["event"] == event]
+
+    entries = list(reversed(entries))[:limit]
+    return {
+        "total_in_buffer": total_in_buffer,
+        "returned":        len(entries),
+        "entries":         entries,
+    }
+
+
+@app.delete("/admin/logs")
+async def clear_admin_logs(admin: dict = Depends(require_admin)):
+    """Clear the in-memory log buffer."""
+    with _log_lock:
+        _LOG_BUFFER.clear()
+    return {"status": "ok", "message": "Log buffer cleared"}
 
 
 # ── Homepage announcement banner ──────────────────────────────────────────
