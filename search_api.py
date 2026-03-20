@@ -1460,21 +1460,32 @@ async def _auto_translate_quote(text_ka: str) -> tuple[str, str]:
     )
     def _call():
         model = genai.GenerativeModel(
-            model_name="models/gemini-2.5-flash",
+            model_name="gemini-1.5-flash",
             generation_config=genai.types.GenerationConfig(
                 max_output_tokens=512, temperature=0.2,
             )
         )
         return model.generate_content(prompt)
+    import re as _re, json as _j
     try:
-        gen  = await asyncio.to_thread(_call)
-        raw  = gen.text.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-        import json as _j
-        data = _j.loads(raw)
-        return data.get("en", ""), data.get("ru", "")
+        gen = await asyncio.to_thread(_call)
+        raw = gen.text.strip()
+        # Strip markdown fences (lstrip/rstrip only strip chars, not substrings — use regex)
+        raw = _re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = _re.sub(r"\s*```\s*$", "", raw).strip()
+        # Extract first JSON object (handles extra text around it)
+        m = _re.search(r'\{[^{}]+\}', raw, _re.DOTALL)
+        if not m:
+            raise ValueError(f"No JSON found in response: {raw[:150]!r}")
+        data = _j.loads(m.group())
+        en = (data.get("en") or "").strip()
+        ru = (data.get("ru") or "").strip()
+        if not en and not ru:
+            raise ValueError(f"Both en/ru empty in: {raw[:150]!r}")
+        return en, ru
     except Exception as e:
         print(f"⚠ Auto-translate failed: {e}")
-        return "", ""
+        raise
 
 
 # ── Daily Quotes CRUD ──────────────────────────────────────────────────────
@@ -1503,7 +1514,12 @@ async def translate_quote_endpoint(body: dict, admin: dict = Depends(require_adm
     text_ka = (body.get("text_ka") or "").strip()
     if not text_ka:
         raise HTTPException(400, "text_ka is required")
-    en, ru = await _auto_translate_quote(text_ka)
+    try:
+        en, ru = await _auto_translate_quote(text_ka)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Translation failed: {str(e)[:200]}")
+    if not en and not ru:
+        raise HTTPException(status_code=500, detail="Translation returned empty results — check GEMINI_API_KEY")
     return {"text_en": en, "text_ru": ru}
 
 
@@ -2365,12 +2381,24 @@ async function autoTranslateQuote() {{
     var r = await fetch(API+'/admin/quotes/translate', {{
       method:'POST', headers:getHeaders(), body:JSON.stringify({{text_ka:ka}})
     }});
-    if(!r.ok) {{ toast('თარგმნა ვერ მოხერხდა: '+r.status, false); return; }}
+    if(!r.ok) {{
+      var errDetail = '';
+      try {{ var errBody = await r.json(); errDetail = errBody.detail || ''; }} catch(_){{}};
+      toast('⚠ '+errDetail || 'თარგმნა ვერ მოხერხდა: '+r.status, false);
+      if(sta) sta.textContent = '❌ ' + (errDetail || 'status '+r.status);
+      return;
+    }}
     var d = await r.json();
-    if(d.text_en) document.getElementById('q-en').value = d.text_en;
-    if(d.text_ru) document.getElementById('q-ru').value = d.text_ru;
-    if(sta) sta.textContent = '✓ EN + RU დასრულდა';
-    toast('✓ AI თარგმნა წარმატებულია', true);
+    var filled = 0;
+    if(d.text_en) {{ document.getElementById('q-en').value = d.text_en; filled++; }}
+    if(d.text_ru) {{ document.getElementById('q-ru').value = d.text_ru; filled++; }}
+    if(filled === 2) {{
+      if(sta) sta.textContent = '✓ EN + RU დასრულდა';
+      toast('✓ AI თარგმნა წარმატებულია', true);
+    }} else {{
+      if(sta) sta.textContent = '⚠ თარგმნა არასრულია';
+      toast('⚠ თარგმნა ვერ შეავსო ველები — Railway log შეამოწმე', false);
+    }}
   }} catch(e) {{
     toast('Error: '+e.message, false);
   }} finally {{
