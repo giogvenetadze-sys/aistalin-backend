@@ -156,6 +156,95 @@ def _is_trivial(query: str) -> bool:
         return bool(_GREETING_PATTERN.match(q))
     return False
 
+
+# ── Query Router ──────────────────────────────────────────────────────────
+# Second-layer classifier that runs AFTER _is_trivial() (pure greetings are
+# already handled before this).  Returns one of four routing labels:
+#   "ambiguous"  — vague prompt with no clear subject → ask to clarify
+#   "social"     — identity / wellbeing questions directed at the bot
+#   "meta"       — questions about the archive itself or bot capabilities
+#   "historical" — default: send through full RAG pipeline
+#
+# IMPORTANT — what was deliberately NOT ported from GPT's suggestion:
+#   • len(q.split()) < 3 → ambiguous   ← removed: "ბუხარინი?" is 1 word but
+#     a perfectly valid historical query; length alone cannot determine type.
+#   • Raw dict returns in handlers       ← handlers use JSONResponse so that
+#     _attach_session() can write the session cookie/header correctly.
+
+_VAGUE_PATTERNS = [
+    # Georgian
+    "მემსჯელო", "მესაუბრე", "რას ფიქრობ", "აბა მითხარი",
+    "ისაუბრე", "მომიყევი", "შეგიძლია მითხრა",
+    # English
+    "tell me something", "what do you think", "discuss", "reflect on",
+    "your thoughts", "what are your views",
+    # Russian
+    "расскажи что-нибудь", "что ты думаешь", "поразмышляй",
+]
+
+_SOCIAL_PATTERNS = [
+    # Georgian
+    "ვინ ხარ", "რა ხარ", "როგორ ხარ", "ხარ თუ არა",
+    # English
+    "who are you", "what are you", "how are you", "are you real",
+    "are you alive", "do you think",
+    # Russian
+    "кто ты", "что ты", "как ты", "ты живой", "ты настоящий",
+]
+
+_META_PATTERNS = [
+    # Georgian
+    "რა შეგიძლია", "რამდენი ტომია", "რა არქივია", "როგორ გამოვიყენო",
+    "რას შეიცავს", "რა პერიოდია", "რომელ წლებს",
+    # English
+    "what can you do", "how many volumes", "what archive", "what years",
+    "what period", "how do i use", "what does this contain",
+    # Russian
+    "что ты умеешь", "сколько томов", "какой архив",
+    "какие годы", "как пользоваться",
+]
+
+def classify_query(query: str) -> str:
+    """
+    Classify query into routing type.
+    Called after _is_trivial() — pure greetings never reach here.
+    Order: ambiguous → social → meta → historical (default).
+    """
+    q = query.strip().lower()
+
+    if any(v in q for v in _VAGUE_PATTERNS):
+        return "ambiguous"
+
+    if any(s in q for s in _SOCIAL_PATTERNS):
+        return "social"
+
+    if any(m in q for m in _META_PATTERNS):
+        return "meta"
+
+    return "historical"
+
+
+# Per-language instant replies for social / meta / ambiguous routes.
+# These are intentionally short — TYPE 1/2 in SYSTEM_INSTRUCTION governs
+# longer LLM-generated answers when the query escapes the backend router.
+_ROUTER_REPLIES = {
+    "social": {
+        "ka": "მე ვარ სტალინის ისტორიული არქივის ანალიტიკური ასისტენტი — არა სტალინი პირადად, არა თანამედროვე AI. ვმუშაობ არქივის ტექსტებიდან. შემიძლია ისტორიული კითხვა დამისვათ.",
+        "en": "I am the analytical assistant of the Stalin Historical Archive — not Stalin personally, not a modern AI. I reason from the archive's texts. You may ask a historical question.",
+        "ru": "Я аналитический ассистент Исторического архива Сталина — не сам Сталин, не современный ИИ. Я работаю с текстами архива. Задайте исторический вопрос.",
+    },
+    "meta": {
+        "ka": "არქივი მოიცავს სტალინის შეგროვებულ ნაშრომებს დაახლოებით 17–18 ტომში; ტექსტები მოიცავს პერიოდს 1901–1952 წლებამდე. ხელმისაწვდომი ენები: ქართული, ინგლისური, რუსული. შეგიძლიათ ნებისმიერ ისტორიულ საკითხზე დამისვათ კითხვა.",
+        "en": "The archive covers Stalin's collected works across approximately 17–18 volumes; the texts span roughly 1901–1952. Available languages: Georgian, English, Russian. You may ask about any historical subject within this scope.",
+        "ru": "Архив охватывает собрание сочинений Сталина в примерно 17–18 томах; тексты охватывают период примерно 1901–1952 годов. Доступные языки: грузинский, английский, русский. Вы можете задать вопрос на любую историческую тему.",
+    },
+    "ambiguous": {
+        "ka": "თქვენი კითხვა ზოგადია. გთხოვთ დააზუსტოთ — კონკრეტულად რომელ საკითხს, პიროვნებას ან მოვლენას ეხება თქვენი შეკითხვა?",
+        "en": "Your question is too general to address precisely. Could you specify which subject, person, or event you are asking about?",
+        "ru": "Вопрос слишком общий для точного ответа. Уточните, пожалуйста — о каком конкретном событии, лице или теме идёт речь?",
+    },
+}
+
 genai.configure(api_key=GEMINI_API_KEY)
 SMTP_HOST    = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT    = int(os.getenv("SMTP_PORT", "587"))
@@ -3013,7 +3102,7 @@ def _generate(prompt: str):
         model_name=CHAT_MODEL,
         system_instruction=SYSTEM_INSTRUCTION,
         generation_config=genai.types.GenerationConfig(
-            max_output_tokens=2000,   # Georgian ~2-3x heavier tokens; 2000 ≈ 650 Georgian words, safe ceiling
+            max_output_tokens=2200,   # Georgian ~2-3x heavier tokens; 2200 ≈ 700 Georgian words, safe ceiling
             temperature=0.25          # low = factual, consistent, Stalin-style analytical
         )
     )
@@ -3055,6 +3144,19 @@ async def chat(
         return JSONResponse(content=ChatResponse(
             query=req.query, answer=reply, sources=[]
         ).dict())
+
+    # ── Query Router (second-layer classification) ────────────────────────
+    # Runs after _is_trivial() — pure greetings never reach here.
+    # Handles social / meta / ambiguous queries WITHOUT touching RAG.
+    # "historical" falls through to the full RAG pipeline below.
+    _qtype = classify_query(req.query)
+    if _qtype in ("social", "meta", "ambiguous"):
+        _lang = req.language if req.language in ("ka", "en", "ru") else "en"
+        _reply = _ROUTER_REPLIES[_qtype][_lang]
+        return JSONResponse(content=ChatResponse(
+            query=req.query, answer=_reply, sources=[]
+        ).dict())
+    # _qtype == "historical" → continue to full RAG pipeline
 
     # ── Cache lookup ──────────────────────────────────────────────────────
     # Safety rules (applied before every read AND write):
