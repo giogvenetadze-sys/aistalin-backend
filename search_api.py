@@ -738,51 +738,30 @@ async def forgot_password(req: ForgotPasswordRequest):
 
     reset_link = f"{FRONTEND_URL}/?reset={token}"
 
-    # Send email via Resend HTTP API (SMTP blocked on Railway hobby plan)
-    if RESEND_API_KEY:
+    # Send email via Brevo HTTP API (SMTP blocked on Railway hobby plan)
+    if BREVO_API_KEY:
         await asyncio.to_thread(_send_reset_email, row["email"], reset_link)
     else:
-        print(f"⚠ RESEND_API_KEY not set. Add it in Railway Variables. Reset link: {reset_link}")
+        print(f"⚠ BREVO_API_KEY not set. Add it in Railway Variables. Reset link: {reset_link}")
 
     print(f"✅ Reset token generated for {row['email']} | link: {reset_link}")
     return {"status": "ok"}
 
 
-# RESEND_API_KEY env var — get free key from resend.com (3000 emails/month free)
-# Railway hobby plan BLOCKS outbound SMTP (port 587/465) — HTTP API is the only option
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-RESEND_FROM    = os.getenv("RESEND_FROM", "AiStalin <noreply@aistalin.io>")
-
-def _resend_post(from_addr: str, to_email: str, subject: str, html_body: str) -> dict:
-    """Make one POST to Resend API. Returns response dict or raises on error."""
-    payload = _json.dumps({
-        "from":    from_addr,
-        "to":      [to_email],
-        "subject": subject,
-        "html":    html_body,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        "https://api.resend.com/emails",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type":  "application/json",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return _json.loads(resp.read())
-
+# ── Brevo (sendinblue) email — HTTP API, 300 emails/day free ──────────────
+# Set BREVO_API_KEY in Railway Variables (xkeysib-...)
+BREVO_API_KEY   = os.getenv("BREVO_API_KEY", "")
+BREVO_FROM_EMAIL = os.getenv("BREVO_FROM_EMAIL", "noreply@aistalin.io")
+BREVO_FROM_NAME  = os.getenv("BREVO_FROM_NAME", "AiStalin")
 
 def _send_reset_email(to_email: str, reset_link: str):
-    """Send password reset email via Resend HTTP API."""
-    if not RESEND_API_KEY:
-        print(f"⚠ RESEND_API_KEY not set — reset link: {reset_link}")
+    """Send password reset email via Brevo HTTP API."""
+    if not BREVO_API_KEY:
+        print(f"⚠ BREVO_API_KEY not set — reset link: {reset_link}")
         return
 
-    # Log config for debugging (first 8 chars of key only)
-    key_preview = RESEND_API_KEY[:8] + "..." if RESEND_API_KEY else "MISSING"
-    print(f"📧 Sending email | from={RESEND_FROM} | to={to_email} | key={key_preview}")
+    key_preview = BREVO_API_KEY[:12] + "..." if BREVO_API_KEY else "MISSING"
+    print(f"📧 Brevo | from={BREVO_FROM_EMAIL} | to={to_email} | key={key_preview}")
 
     html_body = f"""
 <html><body style="font-family:Georgia,serif;background:#1a0c04;color:#f5e6c8;padding:24px;max-width:560px;margin:0 auto;">
@@ -811,17 +790,33 @@ def _send_reset_email(to_email: str, reset_link: str):
   </p>
 </body></html>"""
 
-    subject = "AiStalin — პაროლის განახლება"
+    payload = _json.dumps({
+        "sender":      {"name": BREVO_FROM_NAME, "email": BREVO_FROM_EMAIL},
+        "to":          [{"email": to_email}],
+        "subject":     "AiStalin — პაროლის განახლება",
+        "htmlContent": html_body,
+    }).encode("utf-8")
 
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=payload,
+        headers={
+            "api-key":      BREVO_API_KEY,
+            "Content-Type": "application/json",
+            "Accept":       "application/json",
+        },
+        method="POST",
+    )
     try:
-        result = _resend_post(RESEND_FROM, to_email, subject, html_body)
-        print(f"✅ Email sent → {to_email} | id={result.get('id')}")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = _json.loads(resp.read())
+            print(f"✅ Email sent → {to_email} | messageId={result.get('messageId')}")
     except urllib.error.HTTPError as e:
         raw = e.read().decode()
-        print(f"❌ Resend HTTP {e.code}: {raw}")
-        print(f"❌ RESEND_FROM={RESEND_FROM!r} | key={key_preview}")
+        print(f"❌ Brevo HTTP {e.code}: {raw}")
     except Exception as e:
         print(f"❌ Email error: {type(e).__name__}: {e}")
+
 
 
 @app.post("/reset-password", status_code=200)
