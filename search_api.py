@@ -1,4 +1,3 @@
-
 # search_api.py -- AiStalin Hybrid Search API v2.0.0
 # v2.0: JWT auth, HttpOnly session tokens, velocity check, daily limits
 # v40:  fix translation bug (response_mime_type for Gemini 2.5 Flash),
@@ -10,6 +9,10 @@
 #       login brute-force protection (10 fails / 15 min window),
 #       PADDLE_CLIENT_TOKEN via env + /settings/public injection,
 #       exception detail leak fix in translation endpoint
+# v42:  fix feedback 500 (email col doesn't exist in feedback table → removed),
+#       fix translation (remove response_schema dict — unsupported on Railway SDK,
+#       response_mime_type alone is sufficient; also expose full error detail),
+#       add startup SYSTEM log entry so admin/logs is testable immediately
 # SYSTEM_INSTRUCTION, _generate(), RAG logic -- UNTOUCHED
 
 import os, asyncio, asyncpg, uuid, datetime, secrets, hashlib, hmac, time
@@ -60,12 +63,12 @@ EMBED_MODEL      = "models/gemini-embedding-001"
 TOP_K            = 10
 RRF_K            = 60
 VELOCITY_SECONDS = int(os.getenv("VELOCITY_SECONDS", "5"))
-FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "5"))
+FREE_DAILY_LIMIT = int(os.getenv("FREE_DAILY_LIMIT", "3"))
 
 # ── Chat RAG constants (single source of truth) ───────────────────────────
 # Change these two lines only — no other edits needed to tune chat quality.
 CHAT_TOP_K          = 4   # fused chunks passed to generation (was 5)
-CHAT_SOURCE_LIMIT   = 5   # max sources returned in response
+CHAT_SOURCE_LIMIT   = 3   # max sources returned in response
 PREMIUM_MEMORY_DAYS = 10  # how far back to look for premium chat history
 PREMIUM_MEMORY_TURNS = 5  # max turns injected directly into prompt
 
@@ -518,6 +521,7 @@ async def _create_tables():
                 k, v
             )
     print("OK All tables ready")
+    _alog("INFO", "SYSTEM", f"AiStalin backend started OK | DB pool ready | admin={ADMIN_EMAIL}")
 
 
 @app.on_event("shutdown")
@@ -815,15 +819,25 @@ def _send_reset_email(to_email: str, reset_link: str):
 
     subject = "AiStalin — პაროლის განახლება"
 
-    # Send via configured RESEND_FROM (noreply@aistalin.io)
+    # Attempt 1: Try configured RESEND_FROM (custom domain noreply@aistalin.io)
     try:
         result = _resend_post(RESEND_FROM, to_email, subject, html_body)
         print(f"✅ Email sent ({RESEND_FROM}) → {to_email} | id: {result.get('id')}")
         return
     except urllib.error.HTTPError as e:
         raw = e.read().decode()
-        print(f"⚠ Resend error {e.code}: {raw}")
-        print(f"⚠ RESEND_FROM={RESEND_FROM} | key_prefix={RESEND_API_KEY[:8] if RESEND_API_KEY else 'MISSING'}")
+        # Error 1010 = "from" domain not verified for this API key scope
+        # Auto-fallback to Resend built-in test address — works with ANY valid key
+        if e.code == 403 and "1010" in raw:
+            print(f"⚠ 1010: domain not authorized for this key → fallback to onboarding@resend.dev")
+            try:
+                result = _resend_post("onboarding@resend.dev", to_email, subject, html_body)
+                print(f"✅ Email sent (onboarding@resend.dev) → {to_email} | id: {result.get('id')}")
+                return
+            except Exception as e2:
+                print(f"⚠ Fallback failed: {e2}")
+        else:
+            print(f"⚠ Resend error {e.code}: {raw}")
     except Exception as e:
         print(f"⚠ Email failed: {type(e).__name__}: {e}")
 
@@ -1659,15 +1673,11 @@ async def _auto_translate_quote(text_ka: str) -> tuple[str, str]:
             generation_config=genai.types.GenerationConfig(
                 max_output_tokens=512,
                 temperature=0.1,
-                response_mime_type="application/json",   # forces pure JSON — no markdown fences
-                response_schema={                         # guarantees key names en + ru
-                    "type": "object",
-                    "properties": {
-                        "en": {"type": "string"},
-                        "ru": {"type": "string"},
-                    },
-                    "required": ["en", "ru"],
-                },
+                # response_mime_type alone forces Gemini to return pure JSON.
+                # response_schema (dict form) intentionally removed — it requires
+                # a newer google-generativeai SDK than what Railway has pinned,
+                # causing a silent TypeError that swallows the whole response.
+                response_mime_type="application/json",
             )
         )
         return model.generate_content(prompt)
@@ -1726,8 +1736,8 @@ async def translate_quote_endpoint(body: dict, admin: dict = Depends(require_adm
     try:
         en, ru = await _auto_translate_quote(text_ka)
     except Exception as e:
-        print(f"⚠ Translation error: {e}")   # internal log only
-        raise HTTPException(500, "Translation service temporarily unavailable")
+        # Expose detail so frontend toast shows the real reason
+        raise HTTPException(500, f"Translation failed: {type(e).__name__}: {e}")
     return {"text_en": en, "text_ru": ru}
 
 
@@ -2373,8 +2383,8 @@ tr:hover td{{background:rgba(212,160,23,.03)}}
   </div>
   <div class="tbl-wrap">
     <table>
-      <thead><tr><th>დრო</th><th>სახელი</th><th>ელ-ფოსტა</th><th>შეტყობინება</th></tr></thead>
-      <tbody id="fb-tbody"><tr><td colspan="4" style="text-align:center;padding:2rem;opacity:.4">იტვირთება...</td></tr></tbody>
+      <thead><tr><th>დრო</th><th>სახელი</th><th class="hide-m">მდებარეობა / IP</th><th class="hide-m">დრო / პრემ.</th><th>შეტყობინება</th></tr></thead>
+      <tbody id="fb-tbody"><tr><td colspan="5" style="text-align:center;padding:2rem;opacity:.4">იტვირთება...</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -2839,17 +2849,28 @@ async function loadChats() {{
 async function loadFeedback() {{
   var tb = document.getElementById('fb-tbody');
   if(!tb) return;
-  tb.innerHTML='<tr><td colspan="4" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
+  tb.innerHTML='<tr><td colspan="5" style="text-align:center;padding:1.5rem;opacity:.4">იტვირთება...</td></tr>';
   try {{
     var r = await fetch(API+'/admin/feedback?limit=50', {{headers:getHeaders()}});
-    if(!r.ok) {{ toast('Feedback: '+r.status, false); return; }}
+    if(!r.ok) {{
+      var d = await r.json().catch(function(){{return {{}}}});
+      toast('Feedback error '+r.status+(d.detail?' — '+d.detail:''), false);
+      tb.innerHTML='<tr><td colspan="5" style="text-align:center;padding:1.5rem;color:#ef9a9a">შეცდომა: '+r.status+'</td></tr>';
+      return;
+    }}
     var rows = await r.json();
-    if(!rows.length) {{ tb.innerHTML='<tr><td colspan="4" style="text-align:center;opacity:.4;padding:1.5rem">Feedback არ არის</td></tr>'; return; }}
+    if(!rows.length) {{ tb.innerHTML='<tr><td colspan="5" style="text-align:center;opacity:.4;padding:1.5rem">Feedback შეტყობინება არ არის</td></tr>'; return; }}
     tb.innerHTML = rows.map(function(f){{
-      return '<tr><td style="opacity:.45;white-space:nowrap;font-size:.78rem">'+f.at+'</td>'
+      var premBadge = f.subscribed ? '<span class="badge badge-gold" style="font-size:.65rem">★</span>' : '';
+      return '<tr>'
+        +'<td style="opacity:.45;white-space:nowrap;font-size:.78rem">'+f.at+'</td>'
         +'<td style="font-size:.82rem">'+f.name+'</td>'
-        +'<td style="font-size:.78rem;opacity:.65">'+f.email+'</td>'
-        +'<td style="font-size:.85rem">'+f.message+'</td></tr>';
+        +'<td class="hide-m" style="font-size:.75rem;opacity:.6">'
+          +(f.location||'—')+'<br><span style="opacity:.5;font-size:.7rem">'+(f.ip||'')+'</span></td>'
+        +'<td class="hide-m" style="font-size:.75rem;opacity:.7">'
+          +(f.time_min||0)+'წთ '+premBadge+'</td>'
+        +'<td style="font-size:.85rem;word-break:break-word">'+f.message+'</td>'
+        +'</tr>';
     }}).join('');
   }} catch(e) {{ toast('Error: '+e.message, false); }}
 }}
@@ -2941,14 +2962,31 @@ async def admin_recent_chats(limit: int = 20, admin: dict = Depends(require_admi
 # ── Feedback inbox (admin) ─────────────────────────────────────────────────
 @app.get("/admin/feedback")
 async def admin_feedback(limit: int = 50, admin: dict = Depends(require_admin)):
-    """User feedback submissions."""
+    """User feedback submissions.
+    NOTE: feedback table has no 'email' column — uses ip_address + location instead.
+    Schema: id, name, message, ip_address, location, device, time_spent_seconds,
+            is_subscribed, created_at
+    """
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id, name, email, message, created_at FROM feedback ORDER BY created_at DESC LIMIT $1",
+            """SELECT id, name, message, ip_address, location,
+                      time_spent_seconds, is_subscribed, created_at
+               FROM feedback ORDER BY created_at DESC LIMIT $1""",
             limit
         )
-    return [{"id": r["id"], "name": r["name"], "email": r["email"],
-             "message": r["message"], "at": r["created_at"].strftime("%Y-%m-%d %H:%M")} for r in rows]
+    return [
+        {
+            "id":          r["id"],
+            "name":        r["name"],
+            "location":    r["location"] or "Unknown",
+            "ip":          r["ip_address"] or "Unknown",
+            "time_min":    r["time_spent_seconds"] // 60,
+            "subscribed":  r["is_subscribed"],
+            "message":     r["message"],
+            "at":          r["created_at"].strftime("%Y-%m-%d %H:%M"),
+        }
+        for r in rows
+    ]
 
 
 # ── System event log (admin) ───────────────────────────────────────────────
