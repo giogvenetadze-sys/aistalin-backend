@@ -754,7 +754,7 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM    = os.getenv("RESEND_FROM", "AiStalin <noreply@aistalin.io>")
 
 def _resend_post(from_addr: str, to_email: str, subject: str, html_body: str) -> dict:
-    """Make one POST to Resend API. Returns response dict or raises urllib.error.HTTPError."""
+    """Make one POST to Resend API. Returns response dict or raises on error."""
     payload = _json.dumps({
         "from":    from_addr,
         "to":      [to_email],
@@ -775,15 +775,14 @@ def _resend_post(from_addr: str, to_email: str, subject: str, html_body: str) ->
 
 
 def _send_reset_email(to_email: str, reset_link: str):
-    """Send password reset email via Resend HTTP API.
-    Strategy:
-      1. Try RESEND_FROM (custom domain, e.g. noreply@aistalin.io)
-      2. If error 1010 (domain not verified for this API key), 
-         auto-fallback to onboarding@resend.dev — always works.
-    """
+    """Send password reset email via Resend HTTP API."""
     if not RESEND_API_KEY:
         print(f"⚠ RESEND_API_KEY not set — reset link: {reset_link}")
         return
+
+    # Log config for debugging (first 8 chars of key only)
+    key_preview = RESEND_API_KEY[:8] + "..." if RESEND_API_KEY else "MISSING"
+    print(f"📧 Sending email | from={RESEND_FROM} | to={to_email} | key={key_preview}")
 
     html_body = f"""
 <html><body style="font-family:Georgia,serif;background:#1a0c04;color:#f5e6c8;padding:24px;max-width:560px;margin:0 auto;">
@@ -814,27 +813,15 @@ def _send_reset_email(to_email: str, reset_link: str):
 
     subject = "AiStalin — პაროლის განახლება"
 
-    # Attempt 1: Try configured RESEND_FROM (custom domain noreply@aistalin.io)
     try:
         result = _resend_post(RESEND_FROM, to_email, subject, html_body)
-        print(f"✅ Email sent ({RESEND_FROM}) → {to_email} | id: {result.get('id')}")
-        return
+        print(f"✅ Email sent → {to_email} | id={result.get('id')}")
     except urllib.error.HTTPError as e:
         raw = e.read().decode()
-        # Error 1010 = "from" domain not verified for this API key scope
-        # Auto-fallback to Resend built-in test address — works with ANY valid key
-        if e.code == 403 and "1010" in raw:
-            print(f"⚠ 1010: domain not authorized for this key → fallback to onboarding@resend.dev")
-            try:
-                result = _resend_post("onboarding@resend.dev", to_email, subject, html_body)
-                print(f"✅ Email sent (onboarding@resend.dev) → {to_email} | id: {result.get('id')}")
-                return
-            except Exception as e2:
-                print(f"⚠ Fallback failed: {e2}")
-        else:
-            print(f"⚠ Resend error {e.code}: {raw}")
+        print(f"❌ Resend HTTP {e.code}: {raw}")
+        print(f"❌ RESEND_FROM={RESEND_FROM!r} | key={key_preview}")
     except Exception as e:
-        print(f"⚠ Email failed: {type(e).__name__}: {e}")
+        print(f"❌ Email error: {type(e).__name__}: {e}")
 
 
 @app.post("/reset-password", status_code=200)
