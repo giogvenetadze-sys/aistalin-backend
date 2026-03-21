@@ -701,6 +701,7 @@ async def auth_google(req: GoogleAuthRequest, request: Request):
 # == PASSWORD RESET ENDPOINTS ==============================================
 class ForgotPasswordRequest(BaseModel):
     email: EmailStr
+    lang: str = "ka"  # UI language: ka / en / ru
 
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -736,11 +737,11 @@ async def forgot_password(req: ForgotPasswordRequest):
             row["id"], token, expires
         )
 
-    reset_link = f"{FRONTEND_URL}/?reset={token}"
+    reset_link = f"{FRONTEND_URL}/?reset={token}&lang={req.lang}"
 
     # Send email via Brevo HTTP API (SMTP blocked on Railway hobby plan)
     if BREVO_API_KEY:
-        await asyncio.to_thread(_send_reset_email, row["email"], reset_link)
+        await asyncio.to_thread(_send_reset_email, row["email"], reset_link, req.lang)
     else:
         print(f"⚠ BREVO_API_KEY not set. Add it in Railway Variables. Reset link: {reset_link}")
 
@@ -754,46 +755,75 @@ BREVO_API_KEY   = os.getenv("BREVO_API_KEY", "")
 BREVO_FROM_EMAIL = os.getenv("BREVO_FROM_EMAIL", "noreply@aistalin.io")
 BREVO_FROM_NAME  = os.getenv("BREVO_FROM_NAME", "AiStalin")
 
-def _send_reset_email(to_email: str, reset_link: str):
-    """Send password reset email via Brevo HTTP API."""
+def _send_reset_email(to_email: str, reset_link: str, lang: str = "ka"):
+    """Send password reset email via Brevo HTTP API. Supports ka/en/ru."""
     if not BREVO_API_KEY:
         print(f"⚠ BREVO_API_KEY not set — reset link: {reset_link}")
         return
 
     key_preview = BREVO_API_KEY[:12] + "..." if BREVO_API_KEY else "MISSING"
-    print(f"📧 Brevo | from={BREVO_FROM_EMAIL} | to={to_email} | key={key_preview}")
+    print(f"📧 Brevo | from={BREVO_FROM_EMAIL} | to={to_email} | lang={lang} | key={key_preview}")
+
+    # ── Multilingual email content ────────────────────────────────────────
+    _c = {
+        "ka": {
+            "subject": "AiStalin — პაროლის განახლება",
+            "title":   "🔑 AiStalin.io — პაროლის განახლება",
+            "hello":   "გამარჯობა,",
+            "body":    "მოვიდა მოთხოვნა თქვენი ანგარიშის პაროლის განახლებაზე. თუ ეს თქვენ გამოგზავნეთ, დააჭირეთ ღილაკს:",
+            "btn":     "პაროლის განახლება",
+            "expire":  "ბმული მოქმედებს <strong>1 საათის</strong> განმავლობაში.",
+            "ignore":  "თუ ეს მოთხოვნა არ გამოგზავნიათ, უბრალოდ უგულებელყავით ეს წერილი.",
+            "footer":  "aistalin.io — სტალინის ციფრული არქივი",
+        },
+        "en": {
+            "subject": "AiStalin — Password Reset",
+            "title":   "🔑 AiStalin.io — Password Reset",
+            "hello":   "Hello,",
+            "body":    "A request was received to reset your account password. If you sent this request, click the button below:",
+            "btn":     "Reset Password",
+            "expire":  "This link is valid for <strong>1 hour</strong>.",
+            "ignore":  "If you did not request this, simply ignore this email.",
+            "footer":  "aistalin.io — Stalin's Digital Archive",
+        },
+        "ru": {
+            "subject": "AiStalin — Сброс пароля",
+            "title":   "🔑 AiStalin.io — Сброс пароля",
+            "hello":   "Здравствуйте,",
+            "body":    "Поступил запрос на сброс пароля вашего аккаунта. Если это были вы, нажмите кнопку ниже:",
+            "btn":     "Сбросить пароль",
+            "expire":  "Ссылка действительна в течение <strong>1 часа</strong>.",
+            "ignore":  "Если вы не отправляли этот запрос, просто проигнорируйте это письмо.",
+            "footer":  "aistalin.io — Цифровой архив Сталина",
+        },
+    }
+    t = _c.get(lang, _c["en"])
 
     html_body = f"""
 <html><body style="font-family:Georgia,serif;background:#1a0c04;color:#f5e6c8;padding:24px;max-width:560px;margin:0 auto;">
-  <h2 style="color:#d4a017;border-bottom:1px solid #5c2d0f;padding-bottom:8px;">
-    🔑 AiStalin.io — პაროლის განახლება
-  </h2>
-  <p style="margin-top:16px;">გამარჯობა,</p>
-  <p style="margin-top:8px;opacity:0.85;line-height:1.7;">
-    მოვიდა მოთხოვნა თქვენი ანგარიშის პაროლის განახლებაზე.
-    თუ ეს თქვენ გამოგზავნეთ, დააჭირეთ ღილაკს:
-  </p>
+  <h2 style="color:#d4a017;border-bottom:1px solid #5c2d0f;padding-bottom:8px;">{t["title"]}</h2>
+  <p style="margin-top:16px;">{t["hello"]}</p>
+  <p style="margin-top:8px;opacity:0.85;line-height:1.7;">{t["body"]}</p>
   <div style="text-align:center;margin:32px 0;">
     <a href="{reset_link}"
        style="background:#d4a017;color:#1a0c04;padding:14px 32px;
               border-radius:6px;text-decoration:none;font-weight:bold;
               font-size:1rem;font-family:Georgia,serif;display:inline-block;">
-      პაროლის განახლება
+      {t["btn"]}
     </a>
   </div>
   <p style="opacity:0.65;font-size:0.85rem;line-height:1.7;">
-    ბმული მოქმედებს <strong>1 საათის</strong> განმავლობაში.<br>
-    თუ ეს მოთხოვნა არ გამოგზავნიათ, უბრალოდ უგულებელყავით ეს წერილი.
+    {t["expire"]}<br>{t["ignore"]}
   </p>
   <p style="opacity:0.35;font-size:0.75rem;margin-top:24px;border-top:1px solid #5c2d0f;padding-top:12px;">
-    aistalin.io — სტალინის ციფრული არქივი
+    {t["footer"]}
   </p>
 </body></html>"""
 
     payload = _json.dumps({
         "sender":      {"name": BREVO_FROM_NAME, "email": BREVO_FROM_EMAIL},
         "to":          [{"email": to_email}],
-        "subject":     "AiStalin — პაროლის განახლება",
+        "subject":     t["subject"],
         "htmlContent": html_body,
     }).encode("utf-8")
 
