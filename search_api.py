@@ -1364,7 +1364,7 @@ async def terms_page(lang: str = "ka"):
 """,
         "en": """
 <h1>Terms of Service</h1>
-<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">Last updated: 2025</p>
+<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">Last updated: March 2026</p>
 <p>Welcome to AiStalin. By using this website and its associated services, you agree to the terms set out below. If you do not agree, please do not use our service.</p>
 <h2>1. Description of Service</h2>
 <p>AiStalin is an online historical library and AI-powered research platform. The system allows users to:</p>
@@ -1451,7 +1451,7 @@ async def privacy_page(lang: str = "ka"):
 """,
         "en": """
 <h1>Privacy Policy</h1>
-<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">Last updated: 2025</p>
+<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">Last updated: March 2026</p>
 <p>AiStalin respects user privacy. This policy explains what data we collect and how we use it.</p>
 <h2>1. Data We Collect</h2>
 <ul><li>Email address when creating an account</li><li>Chat messages (to improve the service)</li><li>Technical data (IP address, browser, device)</li><li>System logs for security purposes</li></ul>
@@ -1523,7 +1523,7 @@ async def refund_page(lang: str = "ka"):
 """,
         "en": """
 <h1>Refund Policy</h1>
-<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">Last updated: 2025</p>
+<p style="opacity:.55;font-size:.82rem;margin-bottom:2rem">Last updated: March 2026</p>
 <p>This policy explains the rules for refunds and subscription cancellations for AiStalin's paid services.</p>
 <h2>1. Subscription Type</h2>
 <p>AiStalin offers a <strong>$5/month</strong> Premium subscription that provides unlimited access to the AI chat. Payments are processed by <strong>Paddle</strong>.</p>
