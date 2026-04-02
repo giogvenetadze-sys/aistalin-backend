@@ -943,7 +943,7 @@ async def get_gumroad_checkout_url(user: dict = Depends(get_current_user)):
     email = user.get("email", "") if user else ""
     url = GUMROAD_CHECKOUT_URL
     if email:
-        url = f"{url}?email={email}&wanted=true"
+        url = f"{url}?email={email}"
     return {"checkout_url": url}
 
 
