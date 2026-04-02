@@ -38,12 +38,11 @@ if not JWT_SECRET:
     raise RuntimeError("FATAL: JWT_SECRET env var is not set. App cannot start safely.")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")  # Get from Google Cloud Console → APIs & Services → Credentials
 
-# ── Paddle configuration ─────────────────────────────────────────────────────
-# Paddle dashboard → Developer Tools → Notifications → Notification settings
-PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "")  # Notification secret key
-PADDLE_PRICE_ID       = os.getenv("PADDLE_PRICE_ID", "")        # pri_xxxx — your $5/mo price
-PADDLE_ENV            = os.getenv("PADDLE_ENV", "sandbox")       # "sandbox" | "production"
-PADDLE_CLIENT_TOKEN   = os.getenv("PADDLE_CLIENT_TOKEN", "")    # live_xxx or test_xxx — client-side token for Paddle.js
+# ── Gumroad configuration ────────────────────────────────────────────────────
+GUMROAD_ACCESS_TOKEN = os.getenv("GUMROAD_ACCESS_TOKEN", "")
+GUMROAD_SELLER_ID    = os.getenv("GUMROAD_SELLER_ID", "")
+GUMROAD_PRODUCT_ID   = os.getenv("GUMROAD_PRODUCT_ID", "wodwmq")
+GUMROAD_CHECKOUT_URL = f"https://giogyenet.gumroad.com/l/{GUMROAD_PRODUCT_ID}"
 
 # ── Admin access ─────────────────────────────────────────────────────────────
 # Only this email can access future admin endpoints (e.g. /admin/*)
@@ -929,179 +928,139 @@ async def get_me(user: dict = Depends(get_current_user)):
         result["new_token"] = create_jwt(row["id"], row["email"], row["role"], is_premium)
     return result
 
-# == PADDLE PAYMENT ENDPOINTS ==============================================
-# Paddle Billing (v2 API) uses HMAC-SHA256 for webhook verification.
-# Docs: https://developer.paddle.com/webhooks/signature-verification
+# == GUMROAD PAYMENT ENDPOINTS ==============================================
+# Gumroad sends a POST ping (application/x-www-form-urlencoded) to our
+# /gumroad/webhook URL on every sale, refund, subscription event.
+# Security: we verify seller_id matches our GUMROAD_SELLER_ID env var.
+# Docs: https://help.gumroad.com/article/53-how-do-i-enable-pings
 
-def _verify_paddle_signature(raw_body: bytes, signature_header: str, secret: str) -> bool:
+@app.get("/gumroad/checkout-url")
+async def get_gumroad_checkout_url(user: dict = Depends(get_current_user)):
     """
-    Verify Paddle webhook using HMAC-SHA256.
-    Header format: ts=TIMESTAMP;h1=SIGNATURE
+    Returns the Gumroad checkout URL pre-filled with the user's email.
+    Frontend opens this URL in a new tab.
     """
-    if not secret:
-        # No secret configured — reject all webhooks (secure default)
-        return False
-    try:
-        parts = dict(p.split("=", 1) for p in signature_header.split(";"))
-        timestamp = parts.get("ts", "")
-        signature = parts.get("h1", "")
-        if not timestamp or not signature:
-            return False
-        # Paddle signed payload = "ts:raw_body"
-        signed_payload = f"{timestamp}:{raw_body.decode('utf-8')}".encode()
-        expected = hmac.new(
-            secret.encode("utf-8"),
-            signed_payload,
-            hashlib.sha256,
-        ).hexdigest()
-        return hmac.compare_digest(expected, signature)
-    except Exception as e:
-        print(f"⚠ Paddle sig verification error: {e}")
-        return False
-
-
-class PaddleCheckoutSession(BaseModel):
-    """Frontend calls this to get customer data to pre-fill Paddle checkout."""
-    pass  # all data comes from JWT
-
-
-@app.get("/paddle/config")
-async def get_paddle_config(user: dict = Depends(get_current_user)):
-    """
-    Returns Paddle config + user data for the frontend checkout.
-    Frontend uses this to initialise Paddle.js with the correct price
-    and pre-filled customer info.
-    """
-    if not PADDLE_PRICE_ID:
-        raise HTTPException(500, "Paddle not configured (PADDLE_PRICE_ID missing)")
-
-    uid   = int(user["sub"]) if user else None
     email = user.get("email", "") if user else ""
-
-    return {
-        "price_id":   PADDLE_PRICE_ID,
-        "environment": PADDLE_ENV,        # "sandbox" | "production"
-        "customer": {
-            "email": email,
-        },
-        "custom_data": {
-            "user_id": str(uid) if uid else "",
-            "email":   email,
-        },
-    }
+    url = GUMROAD_CHECKOUT_URL
+    if email:
+        url = f"{url}?email={email}&wanted=true"
+    return {"checkout_url": url}
 
 
-@app.post("/paddle-webhook", status_code=200)
-async def paddle_webhook(request: Request):
+@app.post("/gumroad/webhook", status_code=200)
+async def gumroad_webhook(request: Request):
     """
-    Receives Paddle webhook notifications.
-    Verifies signature, then updates the user's premium status.
+    Receives Gumroad ping notifications (form-urlencoded POST).
 
-    Paddle event types we care about:
-      transaction.completed  → payment succeeded, grant premium
-      subscription.activated → subscription started
-      subscription.cancelled → subscription cancelled (optional: downgrade)
+    resource_name values:
+      sale                    → new purchase / subscription started → grant premium
+      subscription_restarted  → subscription resumed               → grant premium
+      refund                  → purchase refunded                  → revoke premium
+      subscription_ended      → subscription cancelled             → revoke premium
+      subscription_updated    → plan changed (log only)
     """
-    raw_body = await request.body()
-    sig_header = request.headers.get("Paddle-Signature", "")
-
-    # ── Security: verify signature ────────────────────────────────────────
-    if not _verify_paddle_signature(raw_body, sig_header, PADDLE_WEBHOOK_SECRET):
-        print(f"⚠ Paddle webhook: invalid signature | sig={sig_header[:40]}")
-        raise HTTPException(400, "Invalid webhook signature")
-
+    # ── Parse form data ───────────────────────────────────────────────────
     try:
-        payload = _json.loads(raw_body.decode("utf-8"))
+        form = await request.form()
+        data = dict(form)
     except Exception:
-        raise HTTPException(400, "Invalid JSON payload")
+        raise HTTPException(400, "Invalid form payload")
 
-    event_type = payload.get("event_type", "")
-    event_id   = payload.get("notification_id") or payload.get("event_id", str(uuid.uuid4()))
+    # ── Security: verify seller_id ────────────────────────────────────────
+    seller_id = data.get("seller_id", "")
+    if GUMROAD_SELLER_ID and seller_id != GUMROAD_SELLER_ID:
+        print(f"⚠ Gumroad webhook: seller_id mismatch | got={seller_id}")
+        raise HTTPException(400, "Invalid seller_id")
 
-    print(f"📦 Paddle event: {event_type} | id: {event_id}")
+    resource_name = data.get("resource_name", "")
+    sale_id       = data.get("sale_id") or data.get("subscription_id") or str(uuid.uuid4())
+    email         = (data.get("email") or "").lower().strip()
+    is_test       = data.get("test", "false").lower() == "true"
 
-    # ── Only process successful payment events ─────────────────────────────
-    if event_type not in ("transaction.completed", "subscription.activated", "subscription.updated"):
-        # Return 200 so Paddle doesn't retry non-payment events
-        return {"status": "ignored", "event_type": event_type}
+    print(f"📦 Gumroad ping: {resource_name} | sale_id={sale_id} | email={email} | test={is_test}")
 
-    # ── Extract user identification from custom_data ───────────────────────
-    # We pass custom_data.user_id and custom_data.email in the checkout
-    data        = payload.get("data", {})
-    custom_data = data.get("custom_data") or {}
-    email       = (custom_data.get("email") or
-                   data.get("customer", {}).get("email", "")).lower()
-    user_id_str = custom_data.get("user_id", "")
-
-    # ── Extract billing details ────────────────────────────────────────────
-    # Paddle v2 transaction amounts
-    details   = data.get("details", {})
-    totals    = details.get("totals", {})
-    amount    = totals.get("grand_total", 0)
-    currency  = data.get("currency_code", "USD")
-    status    = data.get("status", event_type)
-
-    # Convert cents to dollars (Paddle uses lowest currency unit)
+    # ── Parse amount ──────────────────────────────────────────────────────
     try:
-        amount_usd = float(amount) / 100
+        amount_usd = float(data.get("price", 0)) / 100
     except (TypeError, ValueError):
         amount_usd = 0.0
 
-    # ── Deduplicate — same event_id should only be processed once ──────────
+    currency = data.get("currency", "USD")
+    raw_payload = str(data)[:5000]
+
+    # ── Deduplicate ───────────────────────────────────────────────────────
     async with db_pool.acquire() as conn:
         existing = await conn.fetchval(
-            "SELECT id FROM paddle_transactions WHERE paddle_event_id=$1", event_id
+            "SELECT id FROM paddle_transactions WHERE paddle_event_id=$1", sale_id
         )
         if existing:
-            print(f"ℹ️ Duplicate Paddle event {event_id} — skipping")
+            print(f"ℹ️ Duplicate Gumroad event {sale_id} — skipping")
             return {"status": "already_processed"}
 
-    # ── Find user in DB ────────────────────────────────────────────────────
+    # ── Find user by email ────────────────────────────────────────────────
     user_row = None
-    async with db_pool.acquire() as conn:
-        # Try by user_id first (most reliable), then fall back to email
-        if user_id_str and user_id_str.isdigit():
-            user_row = await conn.fetchrow(
-                "SELECT id, email FROM users WHERE id=$1", int(user_id_str)
-            )
-        if not user_row and email:
+    if email:
+        async with db_pool.acquire() as conn:
             user_row = await conn.fetchrow(
                 "SELECT id, email FROM users WHERE email=$1", email
             )
 
     if not user_row:
-        # Log the transaction even if we can't find the user
-        print(f"⚠ Paddle webhook: user not found | email={email} user_id={user_id_str}")
+        print(f"⚠ Gumroad webhook: user not found | email={email}")
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO paddle_transactions "
                 "(paddle_event_id, user_id, email, amount_usd, status, raw_payload) "
                 "VALUES ($1, NULL, $2, $3, $4, $5)",
-                event_id, email, amount_usd, "user_not_found", raw_body.decode()[:5000]
+                sale_id, email, amount_usd, "user_not_found", raw_payload
             )
         return {"status": "user_not_found"}
 
-    # ── Grant premium — 30 days from now ─────────────────────────────────
-    premium_until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+    uid = user_row["id"]
 
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE users SET is_premium=TRUE, premium_until=$1 WHERE id=$2",
-            premium_until, user_row["id"]
-        )
-        # Log successful transaction
-        await conn.execute(
-            "INSERT INTO paddle_transactions "
-            "(paddle_event_id, user_id, email, amount_usd, status, raw_payload) "
-            "VALUES ($1, $2, $3, $4, $5, $6)",
-            event_id, user_row["id"], user_row["email"],
-            amount_usd, "premium_granted", raw_body.decode()[:5000]
-        )
+    # ── Grant or revoke premium based on event ────────────────────────────
+    if resource_name in ("sale", "subscription_restarted"):
+        # Grant premium for 35 days (5 day buffer over monthly cycle)
+        premium_until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=35)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET is_premium=TRUE, premium_until=$1 WHERE id=$2",
+                premium_until, uid
+            )
+            await conn.execute(
+                "INSERT INTO paddle_transactions "
+                "(paddle_event_id, user_id, email, amount_usd, status, raw_payload) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
+                sale_id, uid, email, amount_usd, "premium_granted", raw_payload
+            )
+        print(f"✅ Premium granted | user_id={uid} email={email} "
+              f"amount=${amount_usd:.2f} until={premium_until.date()} test={is_test}")
+        return {"status": "ok", "premium_granted": True}
 
-    print(f"✅ Premium granted | user_id={user_row['id']} email={user_row['email']} "
-          f"amount=${amount_usd:.2f} until={premium_until.date()}")
+    elif resource_name in ("refund", "subscription_ended"):
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET is_premium=FALSE, premium_until=NULL WHERE id=$1", uid
+            )
+            await conn.execute(
+                "INSERT INTO paddle_transactions "
+                "(paddle_event_id, user_id, email, amount_usd, status, raw_payload) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
+                sale_id, uid, email, amount_usd, "premium_revoked", raw_payload
+            )
+        print(f"🔴 Premium revoked | user_id={uid} email={email} reason={resource_name}")
+        return {"status": "ok", "premium_revoked": True}
 
-    return {"status": "ok", "premium_granted": True}
+    else:
+        # subscription_updated or unknown — log only
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO paddle_transactions "
+                "(paddle_event_id, user_id, email, amount_usd, status, raw_payload) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
+                sale_id, uid, email, amount_usd, resource_name, raw_payload
+            )
+        return {"status": "ignored", "resource_name": resource_name}
 
 
 # == BOOKMARKS ENDPOINTS ====================================================
@@ -1648,9 +1607,8 @@ async def get_public_settings():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT key, value FROM site_settings ORDER BY key")
     settings = {r["key"]: r["value"] for r in rows}
-    # Inject server-side secrets so they never need to be hardcoded in frontend HTML
-    if PADDLE_CLIENT_TOKEN:
-        settings["paddle_client_token"] = PADDLE_CLIENT_TOKEN
+    # Inject Gumroad checkout URL for frontend
+    settings["gumroad_checkout_url"] = GUMROAD_CHECKOUT_URL
     return settings
 
 
