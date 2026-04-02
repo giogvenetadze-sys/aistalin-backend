@@ -940,11 +940,9 @@ async def get_gumroad_checkout_url(user: dict = Depends(get_current_user)):
     Returns the Gumroad checkout URL pre-filled with the user's email.
     Frontend opens this URL in a new tab.
     """
-    email = user.get("email", "") if user else ""
-    url = GUMROAD_CHECKOUT_URL
-    if email:
-        url = f"{url}?email={email}"
-    return {"checkout_url": url}
+    # Note: Gumroad membership pages do not support ?email= URL parameter
+    # Just return the clean product URL
+    return {"checkout_url": GUMROAD_CHECKOUT_URL}
 
 
 @app.post("/gumroad/webhook", status_code=200)
