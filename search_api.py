@@ -38,11 +38,13 @@ if not JWT_SECRET:
     raise RuntimeError("FATAL: JWT_SECRET env var is not set. App cannot start safely.")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")  # Get from Google Cloud Console → APIs & Services → Credentials
 
-# ── Gumroad configuration ────────────────────────────────────────────────────
-GUMROAD_ACCESS_TOKEN = os.getenv("GUMROAD_ACCESS_TOKEN", "")
-GUMROAD_SELLER_ID    = os.getenv("GUMROAD_SELLER_ID", "")
-GUMROAD_PRODUCT_ID   = os.getenv("GUMROAD_PRODUCT_ID", "wodwmq")
-GUMROAD_CHECKOUT_URL = f"https://giogyenet.gumroad.com/l/{GUMROAD_PRODUCT_ID}"
+# ── PayPal configuration ─────────────────────────────────────────────────────
+PAYPAL_CLIENT_ID     = os.getenv("PAYPAL_CLIENT_ID", "")
+PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET", "")
+PAYPAL_PLAN_ID       = os.getenv("PAYPAL_PLAN_ID", "")
+PAYPAL_WEBHOOK_ID    = os.getenv("PAYPAL_WEBHOOK_ID", "")
+PAYPAL_ENV           = os.getenv("PAYPAL_ENV", "live")  # "sandbox" | "live"
+PAYPAL_API_BASE      = "https://api-m.paypal.com" if PAYPAL_ENV == "live" else "https://api-m.sandbox.paypal.com"
 
 # ── Admin access ─────────────────────────────────────────────────────────────
 # Only this email can access future admin endpoints (e.g. /admin/*)
@@ -928,72 +930,179 @@ async def get_me(user: dict = Depends(get_current_user)):
         result["new_token"] = create_jwt(row["id"], row["email"], row["role"], is_premium)
     return result
 
-# == GUMROAD PAYMENT ENDPOINTS ==============================================
-# Gumroad sends a POST ping (application/x-www-form-urlencoded) to our
-# /gumroad/webhook URL on every sale, refund, subscription event.
-# Security: we verify seller_id matches our GUMROAD_SELLER_ID env var.
-# Docs: https://help.gumroad.com/article/53-how-do-i-enable-pings
+# == PAYPAL PAYMENT ENDPOINTS ==============================================
+# PayPal Subscriptions API v2 + Webhook verification
+# Docs: https://developer.paypal.com/docs/subscriptions/
 
-@app.get("/gumroad/checkout-url")
-async def get_gumroad_checkout_url(user: dict = Depends(get_current_user)):
+async def _get_paypal_access_token() -> str:
     """
-    Returns the Gumroad checkout URL pre-filled with the user's email.
-    Frontend opens this URL in a new tab.
+    Get PayPal OAuth2 access token using Client ID + Secret.
+    Token is valid for 9 hours — for production, add caching.
     """
-    # Note: Gumroad membership pages do not support ?email= URL parameter
-    # Just return the clean product URL
-    return {"checkout_url": GUMROAD_CHECKOUT_URL}
+    import base64
+    credentials = base64.b64encode(
+        f"{PAYPAL_CLIENT_ID}:{PAYPAL_CLIENT_SECRET}".encode()
+    ).decode()
+
+    req = urllib.request.Request(
+        f"{PAYPAL_API_BASE}/v1/oauth2/token",
+        data=b"grant_type=client_credentials",
+        headers={
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = _json.loads(resp.read())
+    return data["access_token"]
 
 
-@app.post("/gumroad/webhook", status_code=200)
-async def gumroad_webhook(request: Request):
+def _verify_paypal_webhook(
+    transmission_id: str,
+    timestamp: str,
+    webhook_id: str,
+    event_body: bytes,
+    cert_url: str,
+    auth_algo: str,
+    actual_sig: str,
+) -> bool:
     """
-    Receives Gumroad ping notifications (form-urlencoded POST).
-
-    resource_name values:
-      sale                    → new purchase / subscription started → grant premium
-      subscription_restarted  → subscription resumed               → grant premium
-      refund                  → purchase refunded                  → revoke premium
-      subscription_ended      → subscription cancelled             → revoke premium
-      subscription_updated    → plan changed (log only)
+    Verify PayPal webhook signature via PayPal API.
+    PayPal handles the crypto — we just call their verify endpoint.
+    Returns True if valid.
     """
-    # ── Parse form data ───────────────────────────────────────────────────
+    if not PAYPAL_WEBHOOK_ID:
+        print("⚠ PAYPAL_WEBHOOK_ID not set — accepting webhook (insecure!)")
+        return True
     try:
-        form = await request.form()
-        data = dict(form)
+        import asyncio, concurrent.futures
+        payload = _json.dumps({
+            "transmission_id":   transmission_id,
+            "transmission_time": timestamp,
+            "cert_url":          cert_url,
+            "auth_algo":         auth_algo,
+            "transmission_sig":  actual_sig,
+            "webhook_id":        webhook_id,
+            "webhook_event":     _json.loads(event_body),
+        }).encode()
+
+        # Get access token synchronously (called from sync context)
+        credentials = __import__("base64").b64encode(
+            f"{PAYPAL_CLIENT_ID}:{PAYPAL_CLIENT_SECRET}".encode()
+        ).decode()
+        token_req = urllib.request.Request(
+            f"{PAYPAL_API_BASE}/v1/oauth2/token",
+            data=b"grant_type=client_credentials",
+            headers={"Authorization": f"Basic {credentials}",
+                     "Content-Type": "application/x-www-form-urlencoded"},
+            method="POST"
+        )
+        with urllib.request.urlopen(token_req, timeout=10) as r:
+            token = _json.loads(r.read())["access_token"]
+
+        verify_req = urllib.request.Request(
+            f"{PAYPAL_API_BASE}/v1/notifications/verify-webhook-signature",
+            data=payload,
+            headers={"Authorization": f"Bearer {token}",
+                     "Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(verify_req, timeout=10) as r:
+            result = _json.loads(r.read())
+        status = result.get("verification_status", "")
+        print(f"PayPal webhook verify: {status}")
+        return status == "SUCCESS"
+    except Exception as e:
+        print(f"⚠ PayPal webhook verify error: {e}")
+        return False
+
+
+@app.get("/paypal/config")
+async def get_paypal_config(user: dict = Depends(get_current_user)):
+    """
+    Returns PayPal client-side config for frontend SDK initialization.
+    Called by frontend before rendering the PayPal button.
+    """
+    if not PAYPAL_CLIENT_ID or not PAYPAL_PLAN_ID:
+        raise HTTPException(500, "PayPal not configured")
+    return {
+        "client_id": PAYPAL_CLIENT_ID,
+        "plan_id":   PAYPAL_PLAN_ID,
+        "env":       PAYPAL_ENV,
+        "email":     user.get("email", "") if user else "",
+    }
+
+
+@app.post("/paypal/webhook", status_code=200)
+async def paypal_webhook(request: Request):
+    """
+    Receives PayPal webhook notifications and updates premium status.
+
+    Events we handle:
+      BILLING.SUBSCRIPTION.ACTIVATED   → grant premium
+      BILLING.SUBSCRIPTION.RE-ACTIVATED → grant premium
+      PAYMENT.SALE.COMPLETED           → confirm/extend premium
+      BILLING.SUBSCRIPTION.CANCELLED   → revoke premium
+      BILLING.SUBSCRIPTION.EXPIRED     → revoke premium
+      BILLING.SUBSCRIPTION.SUSPENDED   → revoke premium
+    """
+    raw_body = await request.body()
+
+    # ── Verify PayPal webhook signature ───────────────────────────────────
+    transmission_id = request.headers.get("PayPal-Transmission-Id", "")
+    timestamp       = request.headers.get("PayPal-Transmission-Time", "")
+    cert_url        = request.headers.get("PayPal-Cert-Url", "")
+    auth_algo       = request.headers.get("PayPal-Auth-Algo", "")
+    actual_sig      = request.headers.get("PayPal-Transmission-Sig", "")
+
+    if transmission_id:  # Skip verify only if no headers (local testing)
+        valid = _verify_paypal_webhook(
+            transmission_id, timestamp, PAYPAL_WEBHOOK_ID,
+            raw_body, cert_url, auth_algo, actual_sig
+        )
+        if not valid:
+            print("⚠ PayPal webhook: invalid signature")
+            raise HTTPException(400, "Invalid webhook signature")
+
+    try:
+        payload = _json.loads(raw_body)
     except Exception:
-        raise HTTPException(400, "Invalid form payload")
+        raise HTTPException(400, "Invalid JSON")
 
-    # ── Security: verify seller_id ────────────────────────────────────────
-    seller_id = data.get("seller_id", "")
-    if GUMROAD_SELLER_ID and seller_id != GUMROAD_SELLER_ID:
-        print(f"⚠ Gumroad webhook: seller_id mismatch | got={seller_id}")
-        raise HTTPException(400, "Invalid seller_id")
+    event_type = payload.get("event_type", "")
+    event_id   = payload.get("id", str(uuid.uuid4()))
+    resource   = payload.get("resource", {})
 
-    resource_name = data.get("resource_name", "")
-    sale_id       = data.get("sale_id") or data.get("subscription_id") or str(uuid.uuid4())
-    email         = (data.get("email") or "").lower().strip()
-    is_test       = data.get("test", "false").lower() == "true"
-
-    print(f"📦 Gumroad ping: {resource_name} | sale_id={sale_id} | email={email} | test={is_test}")
-
-    # ── Parse amount ──────────────────────────────────────────────────────
-    try:
-        amount_usd = float(data.get("price", 0)) / 100
-    except (TypeError, ValueError):
-        amount_usd = 0.0
-
-    currency = data.get("currency", "USD")
-    raw_payload = str(data)[:5000]
+    print(f"📦 PayPal event: {event_type} | id={event_id}")
 
     # ── Deduplicate ───────────────────────────────────────────────────────
     async with db_pool.acquire() as conn:
         existing = await conn.fetchval(
-            "SELECT id FROM paddle_transactions WHERE paddle_event_id=$1", sale_id
+            "SELECT id FROM paddle_transactions WHERE paddle_event_id=$1", event_id
         )
         if existing:
-            print(f"ℹ️ Duplicate Gumroad event {sale_id} — skipping")
+            print(f"ℹ️ Duplicate PayPal event {event_id} — skipping")
             return {"status": "already_processed"}
+
+    # ── Extract email from resource ───────────────────────────────────────
+    email = ""
+    # BILLING.SUBSCRIPTION events
+    subscriber = resource.get("subscriber", {})
+    if subscriber:
+        email = subscriber.get("email_address", "").lower().strip()
+    # PAYMENT.SALE events — payer info
+    if not email:
+        payer = resource.get("payer", {})
+        email = payer.get("email_address", "").lower().strip()
+
+    amount_str = resource.get("amount", {}).get("total") or                  resource.get("amount_with_breakdown", {}).get("gross_amount", {}).get("value", "0")
+    try:
+        amount_usd = float(amount_str)
+    except (TypeError, ValueError):
+        amount_usd = 5.0  # default subscription price
+
+    raw_payload = raw_body.decode()[:5000]
 
     # ── Find user by email ────────────────────────────────────────────────
     user_row = None
@@ -1004,21 +1113,31 @@ async def gumroad_webhook(request: Request):
             )
 
     if not user_row:
-        print(f"⚠ Gumroad webhook: user not found | email={email}")
+        print(f"⚠ PayPal webhook: user not found | email={email} | event={event_type}")
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO paddle_transactions "
                 "(paddle_event_id, user_id, email, amount_usd, status, raw_payload) "
                 "VALUES ($1, NULL, $2, $3, $4, $5)",
-                sale_id, email, amount_usd, "user_not_found", raw_payload
+                event_id, email, amount_usd, "user_not_found", raw_payload
             )
         return {"status": "user_not_found"}
 
     uid = user_row["id"]
 
-    # ── Grant or revoke premium based on event ────────────────────────────
-    if resource_name in ("sale", "subscription_restarted"):
-        # Grant premium for 35 days (5 day buffer over monthly cycle)
+    # ── Grant premium ─────────────────────────────────────────────────────
+    grant_events = {
+        "BILLING.SUBSCRIPTION.ACTIVATED",
+        "BILLING.SUBSCRIPTION.RE-ACTIVATED",
+        "PAYMENT.SALE.COMPLETED",
+    }
+    revoke_events = {
+        "BILLING.SUBSCRIPTION.CANCELLED",
+        "BILLING.SUBSCRIPTION.EXPIRED",
+        "BILLING.SUBSCRIPTION.SUSPENDED",
+    }
+
+    if event_type in grant_events:
         premium_until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=35)
         async with db_pool.acquire() as conn:
             await conn.execute(
@@ -1029,13 +1148,13 @@ async def gumroad_webhook(request: Request):
                 "INSERT INTO paddle_transactions "
                 "(paddle_event_id, user_id, email, amount_usd, status, raw_payload) "
                 "VALUES ($1, $2, $3, $4, $5, $6)",
-                sale_id, uid, email, amount_usd, "premium_granted", raw_payload
+                event_id, uid, email, amount_usd, "premium_granted", raw_payload
             )
         print(f"✅ Premium granted | user_id={uid} email={email} "
-              f"amount=${amount_usd:.2f} until={premium_until.date()} test={is_test}")
+              f"event={event_type} until={premium_until.date()}")
         return {"status": "ok", "premium_granted": True}
 
-    elif resource_name in ("refund", "subscription_ended"):
+    elif event_type in revoke_events:
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "UPDATE users SET is_premium=FALSE, premium_until=NULL WHERE id=$1", uid
@@ -1044,21 +1163,20 @@ async def gumroad_webhook(request: Request):
                 "INSERT INTO paddle_transactions "
                 "(paddle_event_id, user_id, email, amount_usd, status, raw_payload) "
                 "VALUES ($1, $2, $3, $4, $5, $6)",
-                sale_id, uid, email, amount_usd, "premium_revoked", raw_payload
+                event_id, uid, email, amount_usd, "premium_revoked", raw_payload
             )
-        print(f"🔴 Premium revoked | user_id={uid} email={email} reason={resource_name}")
+        print(f"🔴 Premium revoked | user_id={uid} email={email} reason={event_type}")
         return {"status": "ok", "premium_revoked": True}
 
     else:
-        # subscription_updated or unknown — log only
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO paddle_transactions "
                 "(paddle_event_id, user_id, email, amount_usd, status, raw_payload) "
                 "VALUES ($1, $2, $3, $4, $5, $6)",
-                sale_id, uid, email, amount_usd, resource_name, raw_payload
+                event_id, uid, email, amount_usd, event_type, raw_payload
             )
-        return {"status": "ignored", "resource_name": resource_name}
+        return {"status": "ignored", "event_type": event_type}
 
 
 # == BOOKMARKS ENDPOINTS ====================================================
@@ -1605,8 +1723,10 @@ async def get_public_settings():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT key, value FROM site_settings ORDER BY key")
     settings = {r["key"]: r["value"] for r in rows}
-    # Inject Gumroad checkout URL for frontend
-    settings["gumroad_checkout_url"] = GUMROAD_CHECKOUT_URL
+    # Inject PayPal client-side config for frontend
+    settings["paypal_client_id"] = PAYPAL_CLIENT_ID
+    settings["paypal_plan_id"]   = PAYPAL_PLAN_ID
+    settings["paypal_env"]       = PAYPAL_ENV
     return settings
 
 
