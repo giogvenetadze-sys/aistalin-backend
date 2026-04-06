@@ -3409,7 +3409,7 @@ FORMAT RULES
 - For difficult questions, prefer disciplined completeness over artificial brevity.
 """
 
-CHAT_MODEL = "models/gemini-2.5-flash"
+CHAT_MODEL = "models/gemini-2.0-flash"   # non-thinking → streams immediately, fast first token
 
 # == PREMIUM MEMORY HELPER ===================================================
 async def _get_premium_memory(user_id: int, language: str) -> str:
@@ -3669,13 +3669,23 @@ async def chat(
     top_score = chunks[0]["score"] if chunks else 0.0
 
     # ── SSE Streaming generator ───────────────────────────────────────────
+
+    # ── SSE Streaming generator ───────────────────────────────────────────
+    # BUG FIX: Gemini chunk iterator is blocking/synchronous.
+    # Iterating it directly in async context blocks the event loop —
+    # FastAPI cannot flush SSE chunks to client until iteration ends.
+    # Fix: run iteration in ThreadPoolExecutor, bridge via asyncio.Queue.
     async def event_stream():
+        import concurrent.futures
         full_answer = []
-        try:
-            # Run blocking Gemini stream call in thread pool
-            def _run_stream():
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_event_loop()
+
+        def _produce():
+            """Blocking Gemini iteration — runs in thread pool."""
+            try:
                 mdl = genai.GenerativeModel(CHAT_MODEL)
-                return mdl.generate_content(
+                stream = mdl.generate_content(
                     prompt,
                     generation_config=genai.types.GenerationConfig(
                         max_output_tokens=2200,
@@ -3683,31 +3693,48 @@ async def chat(
                     ),
                     stream=True,
                 )
+                for chunk in stream:
+                    try:
+                        token = chunk.text or ""
+                    except Exception:
+                        token = ""
+                    if token:
+                        loop.call_soon_threadsafe(queue.put_nowait, ("token", token))
+            except Exception as exc:
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
 
-            stream_obj = await asyncio.to_thread(_run_stream)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = loop.run_in_executor(executor, _produce)
 
-            for chunk in stream_obj:
-                try:
-                    token = chunk.text
-                except Exception:
-                    token = ""
-                if token:
-                    full_answer.append(token)
-                    # SSE format: data: <text>\n\n
-                    yield f"data: {_json.dumps({'t': token})}\n\n"
+        stream_ok = True
+        while True:
+            kind, value = await queue.get()
+            if kind == "token":
+                full_answer.append(value)
+                yield f"data: {_json.dumps({'t': value})}\n\n"
+            elif kind == "error":
+                print(f"⚠ Stream error: {value}")
+                stream_ok = False
+                break
+            elif kind == "done":
+                break
 
-        except Exception as e:
-            print(f"⚠ Stream error: {e}")
-            # Fallback: generate without streaming
+        await future
+        executor.shutdown(wait=False)
+
+        # Fallback if stream produced nothing
+        if not stream_ok or not full_answer:
             try:
                 gen = await asyncio.to_thread(_generate, prompt)
                 fallback = gen.text.strip()
                 full_answer.append(fallback)
                 yield f"data: {_json.dumps({'t': fallback})}\n\n"
             except Exception as e2:
-                print(f"⚠ Fallback also failed: {e2}")
+                print(f"⚠ Fallback failed: {e2}")
 
-        # ── Post-stream: assemble full answer ─────────────────────────────
+        # ── Post-stream: assemble answer ──────────────────────────────────
         answer = "".join(full_answer).strip()
         if not answer:
             answer = {
@@ -3718,7 +3745,6 @@ async def chat(
 
         info_not_found = any(p.lower() in answer.lower() for p in NO_INFO_PHRASES)
         sources_relevant = (not info_not_found) and (top_score >= RRF_SOURCE_THRESHOLD)
-
         sources_data = [
             SourceItem(
                 chunk_id=c["chunk_id"], work_id=c["work_id"], title=c["title"],
@@ -3727,10 +3753,9 @@ async def chat(
             for c in chunks[:CHAT_SOURCE_LIMIT]
         ] if sources_relevant else []
 
-        # Send DONE event with sources + session token
         yield f"data: {_json.dumps({'done': True, 'sources': sources_data, 'session_token': session_token})}\n\n"
 
-        # ── Save to DB (after stream) ─────────────────────────────────────
+        # ── Save to DB ────────────────────────────────────────────────────
         try:
             async with db_pool.acquire() as conn:
                 await conn.execute(
@@ -3749,20 +3774,18 @@ async def chat(
             print(f"⚠ Post-stream DB error: {e}")
 
         # ── Cache write ───────────────────────────────────────────────────
-        _no_info = info_not_found or not chunks
-        if _query_is_cacheable and not _no_info:
+        if _query_is_cacheable and not info_not_found and chunks:
             _cache_set(_ck, answer, sources_data)
             print(f"CACHE STORE | lang={req.language} | key={_ck[:60]}")
 
     headers = {
         "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "X-Accel-Buffering": "no",      # disables Nginx buffering
+        "Cache-Control": "no-cache, no-store",
+        "X-Accel-Buffering": "no",
         "X-Session-Token": session_token,
         "Access-Control-Expose-Headers": "X-Session-Token",
     }
     if is_new_session:
-        # Cookie set via header string (StreamingResponse doesn't support set_cookie())
         is_https = request.url.scheme == "https"
         samesite = "none" if is_https else "lax"
         cookie_val = (
@@ -3776,207 +3799,6 @@ async def chat(
         headers["Set-Cookie"] = cookie_val
 
     return StreamingResponse(event_stream(), headers=headers)
-    if not req.query.strip():
-        raise HTTPException(400, "Query cannot be empty")
-    if req.language not in ["en", "ka", "ru"]:
-        raise HTTPException(400, "language must be en/ka/ru")
-
-    # ── Trivial / greeting bypass ─────────────────────────────────────────
-    # Short greetings skip RAG entirely — no embedding, no DB search, no sources.
-    if _is_trivial(req.query):
-        reply = _GREETING_REPLIES.get(req.language, _GREETING_REPLIES["en"])
-        return JSONResponse(content=ChatResponse(
-            query=req.query, answer=reply, sources=[]
-        ).dict())
-
-    # ── Query Router (second-layer classification) ────────────────────────
-    # Runs after _is_trivial() — pure greetings never reach here.
-    # Handles social / meta / ambiguous queries WITHOUT touching RAG.
-    # "historical" falls through to the full RAG pipeline below.
-    _qtype = classify_query(req.query)
-    if _qtype in ("social", "meta", "ambiguous"):
-        _lang = req.language if req.language in ("ka", "en", "ru") else "en"
-        _reply = _ROUTER_REPLIES[_qtype][_lang]
-        return JSONResponse(content=ChatResponse(
-            query=req.query, answer=_reply, sources=[]
-        ).dict())
-    # _qtype == "historical" → continue to full RAG pipeline
-
-    # ── Cache lookup ──────────────────────────────────────────────────────
-    # Safety rules (applied before every read AND write):
-    #   1. Skip entirely for premium users — their prompt includes personal memory
-    #      context injected from chat_history. Caching that would pollute free-user
-    #      responses with another user's conversation context (data leak).
-    #   2. Skip for very short queries (< 5 chars) — too ambiguous to cache safely.
-    # For free users with substantive queries: cache returns instantly (6h TTL).
-    _ck = _cache_key(req.query, req.language)
-    _is_premium_user = bool(current_user and current_user.get("is_premium"))
-    _query_is_cacheable = len(req.query.strip()) >= 5 and not _is_premium_user
-
-    if _query_is_cacheable:
-        _cached = _cache_get(_ck)
-        if _cached:
-            print(f"CACHE HIT | lang={req.language} | key={_ck[:60]}")
-            return JSONResponse(content=ChatResponse(
-                query=req.query,
-                answer=_cached["answer"],
-                sources=[SourceItem(**s) for s in _cached["sources"]]
-            ).dict())
-
-    # 1. Session token — header takes priority (works on HTTP+HTTPS)
-    #    Frontend stores it in localStorage and sends as X-Session-Token
-    session_token = (
-        request.headers.get("X-Session-Token") or   # from localStorage
-        request.cookies.get(COOKIE_NAME) or          # from HttpOnly cookie (HTTPS)
-        None
-    )
-    is_new_session = not bool(session_token)
-    if is_new_session:
-        session_token = str(uuid.uuid4())
-
-    # 2. Client IP
-    client_ip = get_real_ip(request)
-
-    # 3. Velocity check
-    async with db_pool.acquire() as conn:
-        last_ts = await conn.fetchval(
-            "SELECT created_at FROM chat_history WHERE session_token=$1 ORDER BY created_at DESC LIMIT 1",
-            session_token
-        )
-    if last_ts:
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        if not last_ts.tzinfo:
-            last_ts = last_ts.replace(tzinfo=datetime.timezone.utc)
-        elapsed = (now_utc - last_ts).total_seconds()
-        if elapsed < VELOCITY_SECONDS:
-            raise HTTPException(429, f"Too fast. Wait {int(VELOCITY_SECONDS - elapsed) + 1}s.")
-
-    # 4. Premium / Guest
-    is_premium = bool(current_user and current_user.get("is_premium"))
-    user_id    = int(current_user["sub"]) if current_user else None
-
-    def _attach_session(resp, req=request):
-        # Always return session token in header (works HTTP + HTTPS)
-        resp.headers["X-Session-Token"] = session_token
-        resp.headers["Access-Control-Expose-Headers"] = "X-Session-Token"
-        # Also set cookie — secure only on HTTPS (auto-detected)
-        is_https = req.url.scheme == "https"
-        if is_new_session:
-            resp.set_cookie(
-                key=COOKIE_NAME, value=session_token,
-                httponly=True,
-                secure=is_https,                    # ✅ False on HTTP (dev), True on HTTPS (prod)
-                samesite="none" if is_https else "lax",
-                max_age=60 * 60 * 24 * COOKIE_DAYS
-            )
-        return resp
-
-    today = datetime.date.today()  # computed once — used by both limit check and increment
-
-    if not is_premium:
-        async with db_pool.acquire() as conn:
-            # session count — exact match on session_token+date
-            ses_cnt = await conn.fetchval(
-                "SELECT query_count FROM daily_limits WHERE session_token=$1 AND date=$2",
-                session_token, today) or 0
-            # IP count — sum across ALL sessions from this IP today
-            ip_cnt = await conn.fetchval(
-                "SELECT COALESCE(SUM(query_count),0) FROM daily_limits WHERE ip_address=$1 AND date=$2",
-                client_ip, today) or 0
-        if ses_cnt >= FREE_DAILY_LIMIT or ip_cnt >= FREE_DAILY_LIMIT:
-            return _attach_session(JSONResponse(
-                content={"status": "limit_reached", "message": "Daily free limit reached. Please subscribe."},
-                status_code=200
-            ))
-
-    # 5. RAG retrieval — always use CHAT_TOP_K regardless of req.top_k
-    #    (req.top_k is honoured by /search; chat has its own budget)
-    emb = await get_query_embedding(req.query)
-    vr, fr = await asyncio.gather(
-        vector_search(emb, req.language, CHAT_TOP_K),
-        fts_search(req.query, req.language, CHAT_TOP_K)
-    )
-    chunks = reciprocal_rank_fusion(vr, fr, CHAT_TOP_K)
-
-    if not chunks:
-        answer = {
-            "ka": "არქივში ამ კითხვაზე შესაბამისი ინფორმაცია ვერ მოიძებნა.",
-            "en": "The archive contains no relevant information for this query.",
-            "ru": "В архиве не найдено релевантной информации по данному запросу.",
-        }.get(req.language, "No relevant information found in the archive.")
-    else:
-        # Language-aware volume prefix: ტ. / Vol. / Т.
-        _vol_prefix = {"ka": "ტ.", "en": "Vol.", "ru": "Т."}.get(req.language, "Vol.")
-
-        # Compact context: title + volume only (no extra metadata noise)
-        context = "\n\n---\n\n".join(
-            f"[{i}] {c['title']} ({_vol_prefix}{c.get('volume_num','?')})\n{c['chunk_text']}"
-            for i, c in enumerate(chunks, 1)
-        )
-
-        # Premium memory — inject only for logged-in premium users
-        memory = ""
-        if is_premium and user_id:
-            memory = await _get_premium_memory(user_id, req.language)
-
-        prompt = _build_chat_prompt(req.query, context, req.language, memory)
-        gen = await asyncio.to_thread(_generate, prompt)
-        answer = gen.text.strip()
-
-    info_not_found = any(p.lower() in answer.lower() for p in NO_INFO_PHRASES)
-
-    # Show sources only when:
-    # 1. Answer is not "not found"
-    # 2. At least one chunk has RRF score above threshold (genuinely relevant retrieval)
-    # This prevents sources appearing for greetings, meta-questions, or weak matches.
-    top_score = chunks[0]["score"] if chunks else 0.0
-    sources_relevant = (not info_not_found) and (top_score >= RRF_SOURCE_THRESHOLD)
-
-    sources = [
-        SourceItem(chunk_id=c["chunk_id"], work_id=c["work_id"], title=c["title"],
-                   volume_num=c.get("volume_num"), score=c["score"])
-        for c in chunks[:CHAT_SOURCE_LIMIT]
-    ] if sources_relevant else []
-
-    today = datetime.date.today()  # compute once — used by both save and limit blocks
-
-    # Save history
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO chat_history (user_id,session_token,user_query,ai_response) VALUES ($1,$2,$3,$4)",
-            user_id, session_token, req.query, answer
-        )
-
-    # Increment daily limits — single row per (session_token, date)
-    if not is_premium:
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO daily_limits (session_token, ip_address, date, query_count)
-                VALUES ($1, $2, $3, 1)
-                ON CONFLICT (session_token, date)
-                DO UPDATE SET query_count = daily_limits.query_count + 1
-            """, session_token, client_ip, today)
-
-    data = ChatResponse(query=req.query, answer=answer, sources=sources)
-
-    # ── Cache write ───────────────────────────────────────────────────────
-    # Structural safety checks (more reliable than string matching alone):
-    #   - _query_is_cacheable: not premium + query long enough (set above)
-    #   - info_not_found: explicit "not found" branch OR string-matched phrases
-    #   - sources empty when top_score was above threshold: suspicious — skip
-    # This prevents caching: premium memory responses, "not found" answers,
-    # clarifying questions, and low-quality retrievals.
-    _no_info = (not chunks) or info_not_found
-    if _query_is_cacheable and not _no_info:
-        _cache_set(_ck, answer, [s.dict() for s in sources])
-        print(f"CACHE STORE | lang={req.language} | key={_ck[:60]}")
-    elif not _query_is_cacheable:
-        print(f"CACHE SKIP (premium or short) | lang={req.language}")
-    else:
-        print(f"CACHE MISS+SKIP (no-info answer) | lang={req.language}")
-
-    return _attach_session(JSONResponse(content=data.dict()))
-
 
 # ── Volume Endpoint ──────────────────────────────────────────────────────
 @app.get("/volume/{volume_num}")
