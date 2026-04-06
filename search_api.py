@@ -3917,6 +3917,99 @@ def _send_feedback_email(
         print(f"⚠ Email send failed: {e}")
 
 
+# ══════════════════════════════════════════════════════════════
+#  REACTIONS ENDPOINT
+#  POST /react  — like / dislike / copy / share tracking
+#  Table: aistalin_reactions  (created separately, never touches
+#         the existing 'feedback' table which is for contact msgs)
+# ══════════════════════════════════════════════════════════════
+
+class ReactionRequest(BaseModel):
+    session_id:  str        # anonymous identifier from localStorage
+    source_type: str        # 'chat' | 'search' | 'reader'
+    source_id:   str        # message id, chunk title, or chapter key
+    action:      str        # 'like' | 'dislike' | 'copy' | 'share'
+
+@app.post("/react", status_code=200)
+async def submit_reaction(req: ReactionRequest):
+    """
+    Tracks user reactions on chat messages, search results, and reader articles.
+    Like/Dislike support toggle: clicking the same action twice removes it.
+    Copy and Share are always logged (no toggle).
+    """
+    action = req.action.strip().lower()
+    if action not in ("like", "dislike", "copy", "share"):
+        raise HTTPException(400, "invalid action")
+
+    source_type = req.source_type.strip().lower()
+    if source_type not in ("chat", "search", "reader"):
+        raise HTTPException(400, "invalid source_type")
+
+    source_id  = req.source_id.strip()[:500]
+    session_id = req.session_id.strip()[:200]
+
+    if not session_id or not source_id:
+        raise HTTPException(400, "session_id and source_id required")
+
+    vote = 1 if action == "like" else (-1 if action == "dislike" else None)
+
+    async with db_pool.acquire() as conn:
+        # Like / Dislike: toggle logic
+        # — pressing the same vote again → remove it (undo)
+        # — pressing opposite vote → switch it
+        if action in ("like", "dislike"):
+            existing = await conn.fetchrow(
+                """SELECT id, vote FROM aistalin_reactions
+                   WHERE session_id = $1 AND source_id = $2
+                     AND action IN ('like', 'dislike')""",
+                session_id, source_id
+            )
+            if existing:
+                if existing["vote"] == vote:
+                    # Same button pressed again → undo
+                    await conn.execute(
+                        "DELETE FROM aistalin_reactions WHERE id = $1",
+                        existing["id"]
+                    )
+                    return {"status": "removed", "action": action}
+                else:
+                    # Opposite vote → switch
+                    await conn.execute(
+                        "UPDATE aistalin_reactions SET vote=$1, action=$2 WHERE id=$3",
+                        vote, action, existing["id"]
+                    )
+                    return {"status": "switched", "action": action}
+
+        # Insert new reaction (like/dislike first-time, or copy/share always)
+        await conn.execute(
+            """INSERT INTO aistalin_reactions
+               (session_id, source_type, source_id, action, vote)
+               VALUES ($1, $2, $3, $4, $5)""",
+            session_id, source_type, source_id, action, vote
+        )
+
+    return {"status": "ok", "action": action}
+
+
+# ── Admin: reaction stats ──────────────────────────────────────
+@app.get("/admin/reactions")
+async def admin_reactions(
+    days: int = 30,
+    admin: dict = Depends(require_admin)
+):
+    """Reaction counts grouped by source_type and action for the last N days."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT source_type, action, COUNT(*) AS total
+               FROM aistalin_reactions
+               WHERE created_at >= NOW() - ($1 || ' days')::INTERVAL
+               GROUP BY source_type, action
+               ORDER BY source_type, action""",
+            str(days)
+        )
+    return {"days": days, "stats": [dict(r) for r in rows]}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("search_api:app", host="0.0.0.0", port=8000, reload=True)
