@@ -3675,64 +3675,56 @@ async def chat(
     # Iterating it directly in async context blocks the event loop —
     # FastAPI cannot flush SSE chunks to client until iteration ends.
     # Fix: run iteration in ThreadPoolExecutor, bridge via asyncio.Queue.
+    # ── SSE Streaming generator ──────────────────────────────────────────
+    # Uses generate_content_async(stream=True) — pure async, no threads,
+    # no Queue, no event loop blocking. Each token yields immediately.
+    # Padding: each SSE event padded to ≥256 bytes to defeat proxy buffering.
     async def event_stream():
-        import concurrent.futures
         full_answer = []
-        queue: asyncio.Queue = asyncio.Queue()
-        loop = asyncio.get_event_loop()
 
-        def _produce():
-            """Blocking Gemini iteration — runs in thread pool."""
-            try:
-                mdl = genai.GenerativeModel(CHAT_MODEL)
-                stream = mdl.generate_content(
-                    prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        max_output_tokens=2200,
-                        temperature=0.25,
-                    ),
-                    stream=True,
-                )
-                for chunk in stream:
-                    try:
-                        token = chunk.text or ""
-                    except Exception:
-                        token = ""
-                    if token:
-                        loop.call_soon_threadsafe(queue.put_nowait, ("token", token))
-            except Exception as exc:
-                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+        # SSE comment padding — forces Railway/Nginx/Caddy to flush immediately
+        # Most proxies buffer until they see ~256-1024 bytes
+        _PAD = " " * 256   # appended as SSE comment line
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = loop.run_in_executor(executor, _produce)
+        # Heartbeat: send SSE comment immediately so frontend knows connection is alive
+        yield f": ping\n{_PAD}\n\n"
 
-        stream_ok = True
-        while True:
-            kind, value = await queue.get()
-            if kind == "token":
-                full_answer.append(value)
-                yield f"data: {_json.dumps({'t': value})}\n\n"
-            elif kind == "error":
-                print(f"⚠ Stream error: {value}")
-                stream_ok = False
-                break
-            elif kind == "done":
-                break
+        try:
+            mdl = genai.GenerativeModel(CHAT_MODEL)
+            gen_config = genai.types.GenerationConfig(
+                max_output_tokens=2200,
+                temperature=0.25,
+            )
 
-        await future
-        executor.shutdown(wait=False)
+            # Pure async streaming — no blocking, tokens arrive as generated
+            response_stream = await mdl.generate_content_async(
+                prompt,
+                generation_config=gen_config,
+                stream=True,
+            )
 
-        # Fallback if stream produced nothing
-        if not stream_ok or not full_answer:
+            async for chunk in response_stream:
+                try:
+                    token = chunk.text or ""
+                except Exception:
+                    token = ""
+                if token:
+                    full_answer.append(token)
+                    # Pad to ≥256 bytes so Railway proxy flushes immediately
+                    payload = _json.dumps({"t": token})
+                    pad_needed = max(0, 256 - len(payload) - 8)
+                    yield f"data: {payload}\n: {' ' * pad_needed}\n\n"
+
+        except Exception as e:
+            print(f"⚠ Async stream error: {e}")
+            # Fallback — non-streaming generation
             try:
                 gen = await asyncio.to_thread(_generate, prompt)
                 fallback = gen.text.strip()
                 full_answer.append(fallback)
                 yield f"data: {_json.dumps({'t': fallback})}\n\n"
             except Exception as e2:
-                print(f"⚠ Fallback failed: {e2}")
+                print(f"⚠ Fallback also failed: {e2}")
 
         # ── Post-stream: assemble answer ──────────────────────────────────
         answer = "".join(full_answer).strip()
@@ -3753,6 +3745,7 @@ async def chat(
             for c in chunks[:CHAT_SOURCE_LIMIT]
         ] if sources_relevant else []
 
+        # Final SSE event: sources + session token
         yield f"data: {_json.dumps({'done': True, 'sources': sources_data, 'session_token': session_token})}\n\n"
 
         # ── Save to DB ────────────────────────────────────────────────────
@@ -3777,26 +3770,6 @@ async def chat(
         if _query_is_cacheable and not info_not_found and chunks:
             _cache_set(_ck, answer, sources_data)
             print(f"CACHE STORE | lang={req.language} | key={_ck[:60]}")
-
-    headers = {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache, no-store",
-        "X-Accel-Buffering": "no",
-        "X-Session-Token": session_token,
-        "Access-Control-Expose-Headers": "X-Session-Token",
-    }
-    if is_new_session:
-        is_https = request.url.scheme == "https"
-        samesite = "none" if is_https else "lax"
-        cookie_val = (
-            f"{COOKIE_NAME}={session_token}; "
-            f"HttpOnly; Path=/; "
-            f"Max-Age={60*60*24*COOKIE_DAYS}; "
-            f"SameSite={samesite}"
-        )
-        if is_https:
-            cookie_val += "; Secure"
-        headers["Set-Cookie"] = cookie_val
 
     return StreamingResponse(event_stream(), headers=headers)
 
