@@ -18,7 +18,7 @@ import urllib.request, urllib.error, json as _json
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException, Request, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, Field
 from dotenv import load_dotenv
@@ -3547,6 +3547,235 @@ async def chat(
     response:     Response,
     current_user: Optional[dict] = Depends(get_current_user),
 ):
+    if not req.query.strip():
+        raise HTTPException(400, "Query cannot be empty")
+    if req.language not in ["en", "ka", "ru"]:
+        raise HTTPException(400, "language must be en/ka/ru")
+
+    # ── Trivial / greeting bypass ─────────────────────────────────────────
+    if _is_trivial(req.query):
+        reply = _GREETING_REPLIES.get(req.language, _GREETING_REPLIES["en"])
+        return JSONResponse(content=ChatResponse(
+            query=req.query, answer=reply, sources=[]
+        ).dict())
+
+    # ── Query Router ──────────────────────────────────────────────────────
+    _qtype = classify_query(req.query)
+    if _qtype in ("social", "meta", "ambiguous"):
+        _lang = req.language if req.language in ("ka", "en", "ru") else "en"
+        _reply = _ROUTER_REPLIES[_qtype][_lang]
+        return JSONResponse(content=ChatResponse(
+            query=req.query, answer=_reply, sources=[]
+        ).dict())
+
+    # ── Cache lookup ──────────────────────────────────────────────────────
+    _ck = _cache_key(req.query, req.language)
+    _is_premium_user = bool(current_user and current_user.get("is_premium"))
+    _query_is_cacheable = len(req.query.strip()) >= 5 and not _is_premium_user
+
+    if _query_is_cacheable:
+        _cached = _cache_get(_ck)
+        if _cached:
+            print(f"CACHE HIT | lang={req.language} | key={_ck[:60]}")
+            return JSONResponse(content=ChatResponse(
+                query=req.query,
+                answer=_cached["answer"],
+                sources=[SourceItem(**s) for s in _cached["sources"]]
+            ).dict())
+
+    # ── Session token ─────────────────────────────────────────────────────
+    session_token = (
+        request.headers.get("X-Session-Token") or
+        request.cookies.get(COOKIE_NAME) or
+        None
+    )
+    is_new_session = not bool(session_token)
+    if is_new_session:
+        session_token = str(uuid.uuid4())
+
+    client_ip = get_real_ip(request)
+
+    # ── Velocity check ────────────────────────────────────────────────────
+    async with db_pool.acquire() as conn:
+        last_ts = await conn.fetchval(
+            "SELECT created_at FROM chat_history WHERE session_token=$1 ORDER BY created_at DESC LIMIT 1",
+            session_token
+        )
+    if last_ts:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        if not last_ts.tzinfo:
+            last_ts = last_ts.replace(tzinfo=datetime.timezone.utc)
+        elapsed = (now_utc - last_ts).total_seconds()
+        if elapsed < VELOCITY_SECONDS:
+            raise HTTPException(429, f"Too fast. Wait {int(VELOCITY_SECONDS - elapsed) + 1}s.")
+
+    # ── Premium / Guest ───────────────────────────────────────────────────
+    is_premium = bool(current_user and current_user.get("is_premium"))
+    user_id    = int(current_user["sub"]) if current_user else None
+
+    today = datetime.date.today()
+
+    if not is_premium:
+        async with db_pool.acquire() as conn:
+            ses_cnt = await conn.fetchval(
+                "SELECT query_count FROM daily_limits WHERE session_token=$1 AND date=$2",
+                session_token, today) or 0
+            ip_cnt = await conn.fetchval(
+                "SELECT COALESCE(SUM(query_count),0) FROM daily_limits WHERE ip_address=$1 AND date=$2",
+                client_ip, today) or 0
+        if ses_cnt >= FREE_DAILY_LIMIT or ip_cnt >= FREE_DAILY_LIMIT:
+            r = JSONResponse(
+                content={"status": "limit_reached", "message": "Daily free limit reached."},
+                status_code=200
+            )
+            r.headers["X-Session-Token"] = session_token
+            r.headers["Access-Control-Expose-Headers"] = "X-Session-Token"
+            return r
+
+    # ── RAG retrieval ─────────────────────────────────────────────────────
+    emb = await get_query_embedding(req.query)
+    vr, fr = await asyncio.gather(
+        vector_search(emb, req.language, CHAT_TOP_K),
+        fts_search(req.query, req.language, CHAT_TOP_K)
+    )
+    chunks = reciprocal_rank_fusion(vr, fr, CHAT_TOP_K)
+
+    if not chunks:
+        answer = {
+            "ka": "არქივში ამ კითხვაზე შესაბამისი ინფორმაცია ვერ მოიძებნა.",
+            "en": "The archive contains no relevant information for this query.",
+            "ru": "В архиве не найдено релевантной информации по данному запросу.",
+        }.get(req.language, "No relevant information found.")
+        sources = []
+        # Return plain JSON for no-results (no streaming needed)
+        r = JSONResponse(content=ChatResponse(query=req.query, answer=answer, sources=[]).dict())
+        r.headers["X-Session-Token"] = session_token
+        r.headers["Access-Control-Expose-Headers"] = "X-Session-Token"
+        return r
+
+    # ── Build prompt ──────────────────────────────────────────────────────
+    _vol_prefix = {"ka": "ტ.", "en": "Vol.", "ru": "Т."}.get(req.language, "Vol.")
+    context = "\n\n---\n\n".join(
+        f"[{i}] {c['title']} ({_vol_prefix}{c.get('volume_num','?')})\n{c['chunk_text']}"
+        for i, c in enumerate(chunks, 1)
+    )
+    memory = ""
+    if is_premium and user_id:
+        memory = await _get_premium_memory(user_id, req.language)
+
+    prompt = _build_chat_prompt(req.query, context, req.language, memory)
+
+    # ── Decide sources upfront ────────────────────────────────────────────
+    top_score = chunks[0]["score"] if chunks else 0.0
+
+    # ── SSE Streaming generator ───────────────────────────────────────────
+    async def event_stream():
+        full_answer = []
+        try:
+            # Run blocking Gemini stream call in thread pool
+            def _run_stream():
+                mdl = genai.GenerativeModel(CHAT_MODEL)
+                return mdl.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        max_output_tokens=2200,
+                        temperature=0.25,
+                    ),
+                    stream=True,
+                )
+
+            stream_obj = await asyncio.to_thread(_run_stream)
+
+            for chunk in stream_obj:
+                try:
+                    token = chunk.text
+                except Exception:
+                    token = ""
+                if token:
+                    full_answer.append(token)
+                    # SSE format: data: <text>\n\n
+                    yield f"data: {_json.dumps({'t': token})}\n\n"
+
+        except Exception as e:
+            print(f"⚠ Stream error: {e}")
+            # Fallback: generate without streaming
+            try:
+                gen = await asyncio.to_thread(_generate, prompt)
+                fallback = gen.text.strip()
+                full_answer.append(fallback)
+                yield f"data: {_json.dumps({'t': fallback})}\n\n"
+            except Exception as e2:
+                print(f"⚠ Fallback also failed: {e2}")
+
+        # ── Post-stream: assemble full answer ─────────────────────────────
+        answer = "".join(full_answer).strip()
+        if not answer:
+            answer = {
+                "ka": "პასუხის გენერაცია ვერ მოხერხდა. სცადეთ ხელახლა.",
+                "en": "Failed to generate response. Please try again.",
+                "ru": "Не удалось сгенерировать ответ. Попробуйте ещё раз.",
+            }.get(req.language, "Failed to generate response.")
+
+        info_not_found = any(p.lower() in answer.lower() for p in NO_INFO_PHRASES)
+        sources_relevant = (not info_not_found) and (top_score >= RRF_SOURCE_THRESHOLD)
+
+        sources_data = [
+            SourceItem(
+                chunk_id=c["chunk_id"], work_id=c["work_id"], title=c["title"],
+                volume_num=c.get("volume_num"), score=c["score"]
+            ).dict()
+            for c in chunks[:CHAT_SOURCE_LIMIT]
+        ] if sources_relevant else []
+
+        # Send DONE event with sources + session token
+        yield f"data: {_json.dumps({'done': True, 'sources': sources_data, 'session_token': session_token})}\n\n"
+
+        # ── Save to DB (after stream) ─────────────────────────────────────
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO chat_history (user_id,session_token,user_query,ai_response) VALUES ($1,$2,$3,$4)",
+                    user_id, session_token, req.query, answer
+                )
+            if not is_premium:
+                async with db_pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO daily_limits (session_token, ip_address, date, query_count)
+                        VALUES ($1, $2, $3, 1)
+                        ON CONFLICT (session_token, date)
+                        DO UPDATE SET query_count = daily_limits.query_count + 1
+                    """, session_token, client_ip, today)
+        except Exception as e:
+            print(f"⚠ Post-stream DB error: {e}")
+
+        # ── Cache write ───────────────────────────────────────────────────
+        _no_info = info_not_found or not chunks
+        if _query_is_cacheable and not _no_info:
+            _cache_set(_ck, answer, sources_data)
+            print(f"CACHE STORE | lang={req.language} | key={_ck[:60]}")
+
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",      # disables Nginx buffering
+        "X-Session-Token": session_token,
+        "Access-Control-Expose-Headers": "X-Session-Token",
+    }
+    if is_new_session:
+        # Cookie set via header string (StreamingResponse doesn't support set_cookie())
+        is_https = request.url.scheme == "https"
+        samesite = "none" if is_https else "lax"
+        cookie_val = (
+            f"{COOKIE_NAME}={session_token}; "
+            f"HttpOnly; Path=/; "
+            f"Max-Age={60*60*24*COOKIE_DAYS}; "
+            f"SameSite={samesite}"
+        )
+        if is_https:
+            cookie_val += "; Secure"
+        headers["Set-Cookie"] = cookie_val
+
+    return StreamingResponse(event_stream(), headers=headers)
     if not req.query.strip():
         raise HTTPException(400, "Query cannot be empty")
     if req.language not in ["en", "ka", "ru"]:
